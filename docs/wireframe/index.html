@@ -1,0 +1,786 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermito — terminal workbench prototype</title>
+  <style>
+    /* Hallmark · pre-emit critique: P5 H5 E5 S5 R4 V4 */
+    :root {
+      color-scheme: dark;
+      --font-ui: "SFMono-Regular", "Cascadia Code", "Liberation Mono", monospace;
+      --font-mono: "SFMono-Regular", "Cascadia Code", "Liberation Mono", monospace;
+      --color-canvas: #1e1f22;
+      --color-toolbar: #2b2d30;
+      --color-toolbar-raised: #34363a;
+      --color-panel: #25262a;
+      --color-panel-alt: #202124;
+      --color-editor: #1f2023;
+      --color-field: #1b1c1f;
+      --color-hover: #393b40;
+      --color-pressed: #45484f;
+      --color-border: #45474d;
+      --color-border-soft: #35373c;
+      --color-text: #d8d9dc;
+      --color-text-muted: #9b9da3;
+      --color-text-faint: #777980;
+      --color-blue: #3574f0;
+      --color-blue-hover: #467ff2;
+      --color-blue-soft: #29466f;
+      --color-blue-text: #8cb4ff;
+      --color-green: #5fbe7b;
+      --color-green-soft: #263d2e;
+      --color-red: #f06a6a;
+      --color-red-soft: #4a292c;
+      --color-amber: #d9a343;
+      --color-amber-soft: #493b25;
+      --color-purple: #b392f0;
+      --color-shadow: #121316;
+      --color-overlay: #111215cc;
+      --space-0: 0;
+      --space-1: 0.25rem;
+      --space-2: 0.5rem;
+      --space-3: 0.75rem;
+      --space-4: 1rem;
+      --space-5: 1.25rem;
+      --space-6: 1.5rem;
+      --space-8: 2rem;
+      --space-10: 2.5rem;
+      --size-header: 2.625rem;
+      --size-authority: 1.875rem;
+      --size-status: 1.5rem;
+      --size-stripe: 2.625rem;
+      --size-tool-pane: 14.75rem;
+      --size-context-pane: 13.5rem;
+      --size-bottom-pane: 13.5rem;
+      --size-icon: 1.75rem;
+      --size-logo: 1.25rem;
+      --size-control: 1.75rem;
+      --size-dialog: 34rem;
+      --size-command-dialog: 40rem;
+      --radius-xs: 0.1875rem;
+      --radius-sm: 0.3125rem;
+      --radius-md: 0.5rem;
+      --border-thin: 0.0625rem;
+      --focus-width: 0.125rem;
+      --shadow-dialog: 0 1.25rem 4rem var(--color-shadow);
+      --duration-fast: 120ms;
+      --duration-normal: 180ms;
+      --ease-out: cubic-bezier(.2,.8,.2,1);
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: var(--space-0); overflow: hidden; }
+    body { background: var(--color-canvas); color: var(--color-text); font: 0.75rem/1.35 var(--font-ui); }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    button:focus-visible, input:focus-visible, [tabindex]:focus-visible { outline: var(--focus-width) solid var(--color-blue); outline-offset: calc(var(--focus-width) * -1); }
+    button:disabled { cursor: not-allowed; opacity: .48; }
+    .app { display: grid; grid-template-rows: var(--size-header) var(--size-authority) minmax(0, 1fr) var(--size-status); width: 100%; height: 100%; }
+    .main-toolbar { display: flex; align-items: center; gap: var(--space-2); min-width: 0; padding: var(--space-1) var(--space-2); background: var(--color-toolbar); border-bottom: var(--border-thin) solid var(--color-border); }
+    .brand { display: flex; align-items: center; gap: var(--space-2); flex: 0 0 auto; padding-inline: var(--space-1); font-weight: 650; }
+    .brand img { width: var(--size-logo); height: var(--size-logo); }
+    .toolbar-rule { width: var(--border-thin); height: var(--size-logo); background: var(--color-border); }
+    .widget, .icon-button, .tool-button, .bottom-tab, .button, .command-option, .crumb-button, .authority-button { border: var(--border-thin) solid transparent; background: transparent; cursor: pointer; }
+    .icon { width: var(--space-4); height: var(--space-4); flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .tool-button .icon { width: var(--size-icon); height: var(--size-icon); padding: var(--space-1); }
+    .widget { display: flex; align-items: center; gap: var(--space-2); min-width: 0; height: var(--size-control); padding: var(--space-1) var(--space-2); border-radius: var(--radius-sm); white-space: nowrap; }
+    .widget:hover, .icon-button:hover, .bottom-tab:hover, .authority-button:hover, .crumb-button:hover { background: var(--color-hover); }
+    .widget:active, .icon-button:active, .tool-button:active, .bottom-tab:active { background: var(--color-pressed); }
+    .widget-label { color: var(--color-text-muted); }
+    .widget strong { overflow: hidden; text-overflow: ellipsis; }
+    .project-widget { max-width: 13rem; }
+    .run-widget { max-width: 15rem; }
+    .spacer { flex: 1 1 auto; min-width: var(--space-2); }
+    .command-trigger { min-width: 13rem; justify-content: space-between; color: var(--color-text-muted); background: var(--color-field); border-color: var(--color-border); }
+    kbd { padding: var(--space-0) var(--space-1); color: var(--color-text-faint); background: var(--color-toolbar-raised); border: var(--border-thin) solid var(--color-border); border-radius: var(--radius-xs); font: 0.6875rem var(--font-mono); }
+    .run-button { color: var(--color-green); }
+    .authority-strip { display: flex; align-items: stretch; min-width: 0; background: var(--color-panel-alt); border-bottom: var(--border-thin) solid var(--color-border); }
+    .authority-heading { display: flex; align-items: center; flex: 0 0 auto; padding-inline: var(--space-3); color: var(--color-text-muted); border-right: var(--border-thin) solid var(--color-border-soft); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: .05em; }
+    .authority-segment, .trust-control { display: flex; align-items: center; gap: var(--space-2); min-width: 0; padding-inline: var(--space-3); border: var(--space-0); border-right: var(--border-thin) solid var(--color-border-soft); background: transparent; cursor: pointer; white-space: nowrap; }
+    .authority-segment:hover, .trust-control:hover { background: var(--color-hover); }
+    .authority-segment[aria-pressed="true"] { color: var(--color-amber); background: var(--color-amber-soft); box-shadow: inset 0 calc(var(--focus-width) * -1) var(--color-amber); }
+    .segment-kind { color: inherit; font-weight: 650; }
+    .segment-name { min-width: 0; overflow: hidden; color: var(--color-text-muted); text-overflow: ellipsis; }
+    .segment-state { color: var(--color-text-faint); font-size: 0.6875rem; }
+    .authority-segment[aria-pressed="true"] .segment-state { color: var(--color-amber); font-weight: 650; }
+    .route-arrow { display: flex; align-items: center; padding-inline: var(--space-1); color: var(--color-text-faint); }
+    .trust-control { margin-inline-start: auto; border-right: var(--space-0); border-left: var(--border-thin) solid var(--color-border-soft); color: var(--color-green); }
+    .trust-control.inspect-only { color: var(--color-amber); }
+    .workbench { display: grid; grid-template-columns: var(--size-stripe) var(--size-tool-pane) minmax(20rem, 1fr) var(--size-stripe) var(--size-context-pane); min-height: 0; overflow: hidden; }
+    .workbench.tool-collapsed { grid-template-columns: var(--size-stripe) minmax(20rem, 1fr) var(--size-stripe) var(--size-context-pane); }
+    .workbench.context-collapsed { grid-template-columns: var(--size-stripe) var(--size-tool-pane) minmax(20rem, 1fr) var(--size-stripe); }
+    .workbench.tool-collapsed.context-collapsed { grid-template-columns: var(--size-stripe) minmax(20rem, 1fr) var(--size-stripe); }
+    .stripe { display: flex; flex-direction: column; align-items: stretch; gap: var(--space-1); min-height: 0; padding-block: var(--space-1); background: var(--color-toolbar); border-right: var(--border-thin) solid var(--color-border); }
+    .right-stripe { border-right: var(--space-0); border-left: var(--border-thin) solid var(--color-border); }
+    .stripe-spacer { flex: 1 1 auto; }
+    .tool-button { position: relative; display: grid; place-items: center; min-height: var(--size-stripe); padding: var(--space-1); color: var(--color-text-muted); border-radius: var(--space-0); }
+    .tool-button:hover { color: var(--color-text); background: var(--color-hover); }
+    .tool-button[aria-selected="true"] { color: var(--color-text); background: var(--color-pressed); }
+    .tool-button[aria-selected="true"]::before { content: ""; position: absolute; inset-block: var(--space-1); inset-inline-start: var(--space-0); width: var(--space-1); background: var(--color-blue); }
+    .tool-glyph { font: 650 0.6875rem var(--font-ui); letter-spacing: .02em; }
+    .tool-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    .tool-window, .context-pane { min-width: 0; min-height: 0; overflow: hidden; background: var(--color-panel); border-right: var(--border-thin) solid var(--color-border); }
+    .context-pane { border-right: var(--space-0); border-left: var(--border-thin) solid var(--color-border); }
+    .tool-collapsed .tool-window, .context-collapsed .context-pane { display: none; }
+    .pane-header { display: flex; align-items: center; gap: var(--space-2); height: var(--size-header); padding-inline: var(--space-3) var(--space-1); border-bottom: var(--border-thin) solid var(--color-border-soft); }
+    .pane-header h2 { flex: 1 1 auto; min-width: 0; margin: var(--space-0); font-size: 0.75rem; font-weight: 650; }
+    .icon-button { display: grid; place-items: center; width: var(--size-icon); height: var(--size-icon); padding: var(--space-1); border-radius: var(--radius-sm); }
+    .pane-scroll { height: calc(100% - var(--size-header)); overflow: auto; overscroll-behavior: contain; scrollbar-color: var(--color-border) transparent; }
+    .tree, .context-list, .history { margin: var(--space-0); padding: var(--space-2) var(--space-1); list-style: none; }
+    .tree-row, .context-row { display: flex; align-items: center; gap: var(--space-2); min-height: var(--size-control); padding: var(--space-1) var(--space-2); border-radius: var(--radius-xs); white-space: nowrap; }
+    .tree-row:hover, .context-row:hover { background: var(--color-hover); }
+    .tree-row.selected { background: var(--color-blue-soft); color: var(--color-blue-text); }
+    .indent-1 { padding-inline-start: var(--space-5); }
+    .indent-2 { padding-inline-start: var(--space-8); }
+    .file-state { margin-inline-start: auto; font: 0.6875rem var(--font-mono); color: var(--color-text-faint); }
+    .file-state.modified { color: var(--color-blue-text); }
+    .file-state.conflict { color: var(--color-red); }
+    .side-section { padding: var(--space-3); border-bottom: var(--border-thin) solid var(--color-border-soft); }
+    .side-kicker { margin-block-end: var(--space-2); color: var(--color-text-muted); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: .05em; }
+    .editor-stack { display: grid; grid-template-rows: minmax(0, 1fr) var(--size-bottom-pane); min-width: 0; min-height: 0; background: var(--color-editor); }
+    .editor-stack.bottom-collapsed { grid-template-rows: minmax(0, 1fr) var(--size-control); }
+    .editor { display: grid; grid-template-rows: var(--size-control) var(--size-control) minmax(0, 1fr); min-width: 0; min-height: 0; }
+    .tab-strip { display: flex; min-width: 0; background: var(--color-panel-alt); border-bottom: var(--border-thin) solid var(--color-border); overflow-x: auto; }
+    .editor-tab { display: flex; align-items: center; gap: var(--space-2); min-width: 10rem; padding-inline: var(--space-3); border: var(--space-0); border-right: var(--border-thin) solid var(--color-border-soft); color: var(--color-text-muted); background: var(--color-panel-alt); }
+    .editor-tab.active { color: var(--color-text); background: var(--color-editor); box-shadow: inset 0 var(--focus-width) var(--color-blue); }
+    .breadcrumbs { display: flex; align-items: center; gap: var(--space-1); min-width: 0; padding-inline: var(--space-3); border-bottom: var(--border-thin) solid var(--color-border-soft); color: var(--color-text-muted); overflow: hidden; }
+    .crumb-button { padding: var(--space-1); border-radius: var(--radius-xs); white-space: nowrap; }
+    .editor-surface { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-color: var(--color-border) transparent; }
+    .view { display: none; min-height: 100%; }
+    .view.active { display: block; }
+    .workspace-view { padding: var(--space-5) var(--space-6) var(--space-8); }
+    .workspace-view h1 { margin: var(--space-0) var(--space-0) var(--space-1); font-size: 1.25rem; font-weight: 650; }
+    .lede { max-width: 50rem; margin: var(--space-0) var(--space-0) var(--space-5); color: var(--color-text-muted); }
+    .notice { display: flex; align-items: flex-start; gap: var(--space-3); margin-block-end: var(--space-5); padding: var(--space-3); background: var(--color-amber-soft); border-left: var(--space-1) solid var(--color-amber); }
+    .notice strong { color: var(--color-amber); }
+    .section-title { margin: var(--space-5) var(--space-0) var(--space-2); color: var(--color-text-muted); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: .06em; }
+    .task-table, .port-table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+    th, td { padding: var(--space-2) var(--space-3); border-bottom: var(--border-thin) solid var(--color-border-soft); text-align: left; }
+    th { position: sticky; top: var(--space-0); z-index: 1; color: var(--color-text-muted); background: var(--color-editor); font-weight: 550; }
+    .state-dot { display: inline-block; width: var(--space-2); height: var(--space-2); margin-inline-end: var(--space-2); border-radius: 50%; background: var(--color-text-faint); }
+    .state-dot.ok { background: var(--color-green); }
+    .state-dot.warn { background: var(--color-amber); }
+    .state-dot.bad { background: var(--color-red); }
+    .code-block { margin: var(--space-0); padding: var(--space-4); color: var(--color-text); background: var(--color-field); border: var(--border-thin) solid var(--color-border-soft); font: 0.75rem/1.6 var(--font-mono); white-space: pre-wrap; }
+    .code-line { display: block; padding-inline: var(--space-2); }
+    .line-add { background: var(--color-green-soft); color: var(--color-green); }
+    .line-del { background: var(--color-red-soft); color: var(--color-red); }
+    .line-conflict { background: var(--color-amber-soft); color: var(--color-amber); }
+    .source-editor { min-width: max-content; padding-block: var(--space-3); font: 0.75rem/1.7 var(--font-mono); }
+    .source-row { display: grid; grid-template-columns: var(--space-8) var(--space-4) minmax(38rem, 1fr); min-height: var(--size-control); }
+    .source-row:hover { background: var(--color-panel-alt); }
+    .source-row.issue { background: var(--color-red-soft); }
+    .gutter { padding-inline-end: var(--space-2); color: var(--color-text-faint); text-align: end; user-select: none; }
+    .diagnostic { display: grid; place-items: center; color: var(--color-text-faint); }
+    .diagnostic.error { color: var(--color-red); }
+    .diagnostic.warning { color: var(--color-amber); }
+    .source { padding-inline: var(--space-2) var(--space-8); white-space: pre; }
+    .syn-key { color: var(--color-purple); }
+    .syn-type { color: var(--color-blue-text); }
+    .syn-fn { color: var(--color-green); }
+    .syn-string { color: var(--color-amber); }
+    .syn-comment { color: var(--color-text-faint); }
+    .diagnostic-inline { margin-inline-start: var(--space-4); color: var(--color-red); }
+    .inspector-grid { display: grid; grid-template-columns: minmax(16rem, 1fr) minmax(18rem, 1.5fr); min-height: 100%; }
+    .inspector-column { min-width: 0; padding: var(--space-4); }
+    .inspector-column + .inspector-column { border-left: var(--border-thin) solid var(--color-border); }
+    .route-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2); padding: var(--space-3); border-bottom: var(--border-thin) solid var(--color-border-soft); }
+    .route-card.current { background: var(--color-amber-soft); border-left: var(--space-1) solid var(--color-amber); }
+    .detail-list { display: grid; grid-template-columns: minmax(8rem, auto) minmax(0, 1fr); margin: var(--space-0); }
+    .detail-list dt, .detail-list dd { margin: var(--space-0); padding: var(--space-2) var(--space-3); border-bottom: var(--border-thin) solid var(--color-border-soft); }
+    .detail-list dt { color: var(--color-text-muted); }
+    .git-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 100%; }
+    .git-layout.active { display: grid; }
+    .git-column { min-width: 0; padding: var(--space-4); }
+    .git-column + .git-column { border-left: var(--border-thin) solid var(--color-border); }
+    .surface-header { display: flex; align-items: center; gap: var(--space-2); margin-block-end: var(--space-3); }
+    .surface-header h1 { flex: 1 1 auto; margin: var(--space-0); font-size: 0.875rem; }
+    .button { min-height: var(--size-control); padding: var(--space-1) var(--space-3); border-color: var(--color-border); border-radius: var(--radius-sm); background: var(--color-toolbar-raised); }
+    .button:hover { background: var(--color-hover); }
+    .button.primary { color: var(--color-text); background: var(--color-blue); border-color: var(--color-blue); }
+    .button.primary:hover { background: var(--color-blue-hover); }
+    .button.danger { color: var(--color-red); }
+    .chip { display: inline-flex; align-items: center; gap: var(--space-1); padding: var(--space-1) var(--space-2); border-radius: var(--radius-sm); background: var(--color-toolbar-raised); color: var(--color-text-muted); font-size: 0.6875rem; }
+    .chip.warn { color: var(--color-amber); background: var(--color-amber-soft); }
+    .env-list { display: grid; gap: var(--space-3); padding: var(--space-4); }
+    .env-row { display: grid; grid-template-columns: minmax(10rem, 1.2fr) minmax(8rem, 1fr) auto; align-items: center; gap: var(--space-4); padding: var(--space-3); border: var(--border-thin) solid var(--color-border-soft); }
+    .env-row h2 { margin: var(--space-0) var(--space-0) var(--space-1); font-size: 0.8125rem; }
+    .muted { color: var(--color-text-muted); }
+    .mono { font-family: var(--font-mono); }
+    .ports-view { padding: var(--space-4); }
+    .bottom-window { min-height: 0; overflow: hidden; background: var(--color-panel-alt); border-top: var(--border-thin) solid var(--color-border); }
+    .bottom-collapsed .bottom-panel { display: none; }
+    .bottom-header { display: flex; align-items: center; height: var(--size-control); border-bottom: var(--border-thin) solid var(--color-border-soft); }
+    .bottom-tab { align-self: stretch; padding-inline: var(--space-3); color: var(--color-text-muted); }
+    .bottom-tab[aria-selected="true"] { color: var(--color-text); box-shadow: inset 0 calc(var(--focus-width) * -1) var(--color-blue); }
+    .bottom-actions { display: flex; align-items: center; gap: var(--space-1); margin-inline-start: auto; padding-inline-end: var(--space-1); }
+    .bottom-panel { height: calc(100% - var(--size-control)); min-height: 0; overflow: auto; }
+    .terminal-output { margin: var(--space-0); padding: var(--space-3); color: var(--color-text); font: 0.75rem/1.55 var(--font-mono); white-space: pre-wrap; scrollbar-color: var(--color-border) transparent; }
+    .terminal-output.capture { box-shadow: inset 0 0 0 var(--focus-width) var(--color-amber); }
+    .bottom-list { margin: var(--space-0); padding: var(--space-2); list-style: none; }
+    .bottom-list li { display: grid; grid-template-columns: 5rem minmax(0, 1fr) auto; gap: var(--space-3); padding: var(--space-2) var(--space-3); border-bottom: var(--border-thin) solid var(--color-border-soft); }
+    .bottom-list strong { font-family: var(--font-mono); font-weight: 550; }
+    .prompt { color: var(--color-green); }
+    .authority-popover { position: absolute; inset-block-start: calc(var(--size-header) + var(--size-authority)); inset-inline-end: var(--space-3); z-index: 20; width: 18rem; padding: var(--space-2); background: var(--color-toolbar); border: var(--border-thin) solid var(--color-border); box-shadow: var(--shadow-dialog); }
+    .authority-popover[hidden] { display: none; }
+    .authority-button { display: grid; grid-template-columns: var(--space-4) 1fr auto; gap: var(--space-2); width: 100%; padding: var(--space-2); text-align: left; border-radius: var(--radius-sm); }
+    .authority-button[aria-checked="true"] { background: var(--color-blue-soft); }
+    .authority-button .authority-meta { color: var(--color-text-muted); font-size: 0.6875rem; }
+    .status-bar { display: flex; align-items: center; gap: var(--space-3); min-width: 0; padding-inline: var(--space-2); background: var(--color-blue-soft); border-top: var(--border-thin) solid var(--color-blue); color: var(--color-text); }
+    .status-item { display: flex; align-items: center; gap: var(--space-1); white-space: nowrap; }
+    .status-spacer { flex: 1 1 auto; }
+    .status-button { border: var(--space-0); background: transparent; cursor: pointer; }
+    dialog { width: min(var(--size-dialog), calc(100% - var(--space-8))); padding: var(--space-0); color: var(--color-text); background: var(--color-toolbar); border: var(--border-thin) solid var(--color-border); border-radius: var(--radius-md); box-shadow: var(--shadow-dialog); }
+    dialog.command-dialog { width: min(var(--size-command-dialog), calc(100% - var(--space-8))); }
+    dialog::backdrop { background: var(--color-overlay); }
+    .dialog-head { padding: var(--space-4); border-bottom: var(--border-thin) solid var(--color-border); font-size: 0.875rem; font-weight: 650; }
+    .dialog-body { padding: var(--space-4); color: var(--color-text-muted); }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-top: var(--border-thin) solid var(--color-border-soft); }
+    .command-input { width: 100%; height: var(--size-control); padding-inline: var(--space-3); color: var(--color-text); background: var(--color-field); border: var(--border-thin) solid var(--color-border); border-radius: var(--radius-sm); }
+    .command-list { max-height: 17rem; margin: var(--space-3) var(--space-0) var(--space-0); padding: var(--space-0); overflow: auto; list-style: none; }
+    .command-option { display: flex; justify-content: space-between; width: 100%; padding: var(--space-2) var(--space-3); color: var(--color-text); border-radius: var(--radius-sm); text-align: left; }
+    .command-option:hover, .command-option.active { background: var(--color-blue-soft); }
+    .toast { position: fixed; inset-inline-end: var(--space-4); inset-block-end: calc(var(--size-status) + var(--space-4)); z-index: 40; max-width: 24rem; padding: var(--space-3) var(--space-4); color: var(--color-text); background: var(--color-toolbar-raised); border: var(--border-thin) solid var(--color-border); border-left: var(--space-1) solid var(--color-blue); box-shadow: var(--shadow-dialog); opacity: 0; pointer-events: none; transform: translateY(var(--space-2)); transition: opacity var(--duration-normal) var(--ease-out), transform var(--duration-normal) var(--ease-out); }
+    .toast.show { opacity: 1; transform: translateY(var(--space-0)); }
+    [hidden] { display: none !important; }
+    @media (max-width: 68rem) {
+      .workbench { grid-template-columns: var(--size-stripe) 12rem minmax(18rem, 1fr) var(--size-stripe); }
+      .context-pane { display: none; }
+      .command-trigger { min-width: var(--size-control); }
+      .command-trigger .command-text, .command-trigger kbd { display: none; }
+      .inspector-grid { grid-template-columns: minmax(0, 1fr); }
+      .inspector-column + .inspector-column { border-left: var(--space-0); border-top: var(--border-thin) solid var(--color-border); }
+    }
+    @media (max-width: 48rem) {
+      .workbench { grid-template-columns: var(--size-stripe) minmax(16rem, 1fr) var(--size-stripe); }
+      .tool-window { display: none; }
+      .widget-label, .project-widget strong, .vcs-widget .widget-label { display: none; }
+      .project-widget { max-width: var(--size-control); }
+      .git-layout { grid-template-columns: minmax(0, 1fr); }
+      .git-column + .git-column { border-left: var(--space-0); border-top: var(--border-thin) solid var(--color-border); }
+      .env-row { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
+      .status-item.optional { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) { .toast { transition-duration: var(--duration-fast); transform: none; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="main-toolbar" data-landmark aria-label="Main toolbar">
+      <div class="brand"><img src="hermito-mark.svg" alt=""><span>Hermito</span></div>
+      <div class="toolbar-rule" aria-hidden="true"></div>
+      <button class="widget project-widget" id="projectWidget" type="button" aria-controls="toolWindow" aria-expanded="true" title="Project [PR] · Alt+1"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M3.5 6.5h6l2 2h9v10h-17z"/><path d="M3.5 6.5v-2h6l2 2"/></svg><strong>Hermito</strong><span class="widget-label">~/Personal/Hermito</span></button>
+      <button class="widget vcs-widget" type="button" data-switch-view="git" title="Git [GT] · Alt+2"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="7" cy="5" r="2"/><circle cx="17" cy="19" r="2"/><circle cx="7" cy="19" r="2"/><path d="M7 7v10M9 7c6 0 8 2 8 10"/></svg><strong>feature/remote-authority</strong><span class="chip warn">2 conflicts</span></button>
+      <button class="widget run-widget" id="authorityTrigger" type="button" aria-haspopup="menu" aria-expanded="false" title="Choose execution authority [AU]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4v16M5 8h8l-2-2m2 2-2 2M5 16h13l-2-2m2 2-2 2"/></svg><strong id="runTarget">Local · cargo run</strong><span aria-hidden="true">⌄</span></button>
+      <button class="icon-button run-button" id="runButton" type="button" aria-label="Run current target through selected authority" title="Run through CURRENT authority [RUN]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></svg></button>
+      <div class="spacer"></div>
+      <button class="widget command-trigger" id="commandTrigger" type="button" aria-haspopup="dialog" title="Search everywhere [⌘K]"><span class="command-text">Search everywhere or run a command</span><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/></svg><kbd>⌘K</kbd></button>
+      <button class="icon-button" id="bottomToggle" type="button" aria-label="Toggle bottom tool body" aria-pressed="false" title="Bottom tools [BT]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M3 15h18"/></svg></button>
+    </header>
+
+    <nav class="authority-strip" data-landmark aria-label="Execution authority and workspace trust">
+      <span class="authority-heading">Authority</span>
+      <button class="authority-segment" type="button" data-authority="local" aria-pressed="true"><span class="segment-kind">LOCAL</span><span class="segment-name">huy-mac</span><span class="segment-state">CURRENT</span></button>
+      <span class="route-arrow" aria-hidden="true">→</span>
+      <button class="authority-segment" type="button" data-authority="ssh" aria-pressed="false"><span class="segment-kind">SSH</span><span class="segment-name">buildbox</span><span class="segment-state">INSPECT ONLY</span></button>
+      <span class="route-arrow" aria-hidden="true">→</span>
+      <button class="authority-segment" type="button" data-authority="container" aria-pressed="false"><span class="segment-kind">DEVCONTAINER</span><span class="segment-name">hermito-dev</span><span class="segment-state">TRUSTED</span></button>
+      <button class="trust-control" id="trustStripButton" type="button" data-open-trust><span id="trustState">[+] TRUSTED · execution granted</span></button>
+    </nav>
+
+    <div class="workbench context-collapsed" id="workbench">
+      <nav class="stripe" data-landmark aria-label="Tool windows">
+        <button class="tool-button" type="button" data-view="workspace" aria-selected="true" title="Project [PR] · Alt+1"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M3.5 6.5h6l2 2h9v10h-17z"/><path d="M3.5 6.5v-2h6l2 2"/></svg><span class="tool-label">Project</span></button>
+        <button class="tool-button" type="button" data-view="git" aria-selected="false" title="Git [GT] · Alt+2"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="7" cy="5" r="2"/><circle cx="17" cy="19" r="2"/><circle cx="7" cy="19" r="2"/><path d="M7 7v10M9 7c6 0 8 2 8 10"/></svg><span class="tool-label">Git</span></button>
+        <button class="tool-button" type="button" data-view="environments" aria-selected="false" title="Environments [EN] · Alt+3"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="6" rx="1"/><rect x="4" y="14" width="16" height="6" rx="1"/><path d="M8 7h.01M8 17h.01M12 7h5M12 17h5"/></svg><span class="tool-label">Environments</span></button>
+        <button class="tool-button" type="button" data-view="ports" aria-selected="false" title="Ports [PT] · Alt+4"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M8 4v5m8-5v5M6 9h12v3a6 6 0 0 1-12 0zM12 18v3"/></svg><span class="tool-label">Ports</span></button>
+        <div class="stripe-spacer"></div>
+        <button class="tool-button" id="trustButton" type="button" data-open-trust title="Workspace trust [TR]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 2.8 8 7 10 4.2-2 7-5.4 7-10V6z"/><path d="m9 12 2 2 4-5"/></svg><span class="tool-label">Workspace trust</span></button>
+      </nav>
+
+      <aside class="tool-window" id="toolWindow" data-landmark aria-label="Project tool window">
+        <div class="pane-header"><h2 id="toolTitle">Project</h2><button class="icon-button" id="collapseTool" type="button" aria-label="Collapse tool window">×</button></div>
+        <div class="pane-scroll">
+          <section class="side-panel" data-side-view="workspace">
+            <ul class="tree" aria-label="Project files">
+              <li class="tree-row selected"><span aria-hidden="true">⌄</span><strong>Hermito</strong></li>
+              <li class="tree-row indent-1"><span aria-hidden="true">⌄</span>src</li>
+              <li class="tree-row indent-2">main.rs <span class="file-state modified">M</span></li>
+              <li class="tree-row indent-2">authority.rs <span class="file-state modified">M</span></li>
+              <li class="tree-row indent-2">terminal.rs</li>
+              <li class="tree-row indent-1"><span aria-hidden="true">⌄</span>docs</li>
+              <li class="tree-row indent-2">design-guidelines.md</li>
+              <li class="tree-row indent-2">wireframe</li>
+              <li class="tree-row indent-1">Cargo.toml</li>
+              <li class="tree-row indent-1">README.md</li>
+            </ul>
+          </section>
+          <section class="side-panel" data-side-view="git" hidden>
+            <div class="side-section"><div class="side-kicker">Merge conflicts</div><div class="tree-row selected">src/authority.rs <span class="file-state conflict">!</span></div><div class="tree-row">src/terminal.rs <span class="file-state conflict">!</span></div></div>
+            <div class="side-section"><div class="side-kicker">Changes</div><div class="tree-row">docs/wireframe/index.html <span class="file-state modified">M</span></div><div class="tree-row">src/main.rs <span class="file-state modified">M</span></div></div>
+          </section>
+          <section class="side-panel" data-side-view="environments" hidden>
+            <div class="side-section"><div class="side-kicker">Dev Containers</div><div class="tree-row selected"><span class="state-dot ok"></span>hermito-dev</div><div class="tree-row"><span class="state-dot"></span>rust-nightly</div></div>
+            <div class="side-section"><div class="side-kicker">SSH targets</div><div class="tree-row"><span class="state-dot warn"></span>buildbox · 10.0.0.24</div></div>
+          </section>
+          <section class="side-panel" data-side-view="ports" hidden>
+            <div class="side-section"><div class="side-kicker">Leases</div><div class="tree-row selected"><span class="state-dot ok"></span>3000 · web</div><div class="tree-row"><span class="state-dot ok"></span>9229 · inspector</div></div>
+            <div class="side-section"><div class="side-kicker">Discovered</div><div class="tree-row"><span class="state-dot warn"></span>5432 · postgres</div></div>
+          </section>
+        </div>
+      </aside>
+
+      <main class="editor-stack bottom-collapsed" id="editorStack" data-landmark aria-label="Editor and tool windows">
+        <section class="editor" aria-label="Editor">
+          <div class="tab-strip" role="tablist" aria-label="Open editors"><button class="editor-tab" type="button" role="tab" aria-selected="false"><span class="file-state modified">M</span><span>src/main.rs</span><span aria-hidden="true">×</span></button><button class="editor-tab active" type="button" role="tab" aria-selected="true"><span id="editorFileState">M</span><span id="editorTabLabel">src/authority.rs</span><span aria-hidden="true">×</span></button><button class="editor-tab" type="button" role="tab" aria-selected="false"><span>●</span><span>src/terminal.rs</span><span aria-hidden="true">×</span></button></div>
+          <nav class="breadcrumbs" aria-label="Breadcrumb"><button class="crumb-button" type="button">Hermito</button><span aria-hidden="true">›</span><button class="crumb-button" id="crumbArea" type="button">src</button><span aria-hidden="true">›</span><span id="crumbCurrent">authority.rs</span><span aria-hidden="true">›</span><span class="muted">resolve_target()</span></nav>
+          <div class="editor-surface" id="editorSurface">
+            <article class="view active" data-view-panel="workspace" aria-label="Rust source editor">
+              <div class="source-editor" role="table" aria-label="src/authority.rs source with diagnostics">
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">1</span><span class="diagnostic"></span><code class="source"><span class="syn-key">use</span> crate::trust::{TrustDecision, TrustStore};</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">2</span><span class="diagnostic"></span><code class="source"><span class="syn-key">use</span> crate::target::{ExecutionTarget, TargetKind};</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">3</span><span class="diagnostic"></span><code class="source"></code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">4</span><span class="diagnostic"></span><code class="source"><span class="syn-key">pub struct</span> <span class="syn-type">AuthorityRoute</span> {</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">5</span><span class="diagnostic"></span><code class="source">    current: ExecutionTarget,</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">6</span><span class="diagnostic"></span><code class="source">    trust: TrustStore,</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">7</span><span class="diagnostic"></span><code class="source">}</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">8</span><span class="diagnostic"></span><code class="source"></code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">9</span><span class="diagnostic"></span><code class="source"><span class="syn-key">impl</span> <span class="syn-type">AuthorityRoute</span> {</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">10</span><span class="diagnostic"></span><code class="source">    <span class="syn-key">pub fn</span> <span class="syn-fn">resolve_target</span>(&amp;self, requested: ExecutionTarget) -&gt; Result&lt;ExecutionTarget&gt; {</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">11</span><span class="diagnostic"></span><code class="source">        <span class="syn-key">match</span> requested.kind() {</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">12</span><span class="diagnostic"></span><code class="source">            TargetKind::Local =&gt; Ok(requested),</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">13</span><span class="diagnostic warning" title="Remote authority requires explicit trust">●</span><code class="source">            TargetKind::Ssh =&gt; self.trust.require(requested), <span class="syn-comment">// inspect-only until granted</span></code></div>
+                <div class="source-row issue" role="row"><span class="gutter" aria-hidden="true">14</span><span class="diagnostic error" title="Non-exhaustive authority transition">●</span><code class="source">            TargetKind::DevContainer =&gt; self.route_container(requested)<span class="diagnostic-inline">E0004: handle revoked trust</span></code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">15</span><span class="diagnostic"></span><code class="source">        }</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">16</span><span class="diagnostic"></span><code class="source">    }</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">17</span><span class="diagnostic"></span><code class="source"></code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">18</span><span class="diagnostic"></span><code class="source">    <span class="syn-key">pub fn</span> <span class="syn-fn">run</span>(&amp;self, command: &amp;str) -&gt; Result&lt;ExitStatus&gt; {</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">19</span><span class="diagnostic"></span><code class="source">        self.current.spawn(command)</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">20</span><span class="diagnostic"></span><code class="source">    }</code></div>
+                <div class="source-row" role="row"><span class="gutter" aria-hidden="true">21</span><span class="diagnostic"></span><code class="source">}</code></div>
+              </div>
+            </article>
+
+            <article class="view git-layout" data-view-panel="git" aria-label="Git conflict editor">
+              <section class="git-column"><div class="surface-header"><h1>Conflict · src/authority.rs</h1><span class="chip warn">unresolved</span></div><pre class="code-block"><span class="code-line">pub fn resolve_target(request: RunRequest) {</span><span class="code-line line-conflict">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</span><span class="code-line line-del">-   Authority::Local</span><span class="code-line line-conflict">=======</span><span class="code-line line-add">+   authority.require_trust(request.target)?;</span><span class="code-line line-add">+   Authority::Remote(request.target)</span><span class="code-line line-conflict">&gt;&gt;&gt;&gt;&gt;&gt;&gt; origin/remote-authority</span><span class="code-line">}</span></pre><div class="surface-header"><button class="button primary" type="button" id="acceptHunk">Accept remote with trust guard</button><button class="button danger" type="button" id="discardHunk">Discard hunk…</button></div></section>
+              <section class="git-column"><div class="surface-header"><h1>History</h1><span class="chip">feature/remote-authority</span></div><ul class="history"><li class="context-row"><span class="state-dot ok"></span><span><strong>4fd1ae7</strong> Guard remote spawn with trust<br><span class="muted">N. Tran · 18 minutes ago</span></span></li><li class="context-row"><span class="state-dot"></span><span><strong>c20d993</strong> Track terminal capture ownership<br><span class="muted">N. Tran · yesterday</span></span></li><li class="context-row"><span class="state-dot"></span><span><strong>8ba42f0</strong> Lease loopback ports per workspace<br><span class="muted">A. Lee · 2 days ago</span></span></li><li class="context-row"><span class="state-dot"></span><span><strong>2d913a1</strong> Add SSH host-key confirmation<br><span class="muted">A. Lee · 3 days ago</span></span></li></ul></section>
+            </article>
+
+            <article class="view" data-view-panel="environments" aria-label="Environment inspector">
+              <div class="inspector-grid">
+                <section class="inspector-column">
+                  <div class="surface-header"><h1>Authority chain</h1><span class="chip warn">Local is current</span></div>
+                  <div class="route-card current"><div><strong>LOCAL · huy-mac</strong><div class="muted mono">aarch64-apple-darwin · uid 501</div></div><span class="chip warn">CURRENT</span></div>
+                  <div class="route-card"><div><strong>SSH · buildbox</strong><div class="muted mono">dev@10.0.0.24 · host key verified</div></div><span class="chip warn">INSPECT ONLY</span></div>
+                  <div class="route-card"><div><strong>DEVCONTAINER · hermito-dev</strong><div class="muted mono">ghcr.io/hermito/dev:rust-1.82</div></div><span class="chip">TRUSTED</span></div>
+                </section>
+                <section class="inspector-column">
+                  <div class="surface-header"><h1>Environment inspector</h1><button class="button" type="button" id="refreshEnvironments">Refresh</button></div>
+                  <dl class="detail-list"><dt>Lifecycle</dt><dd><span class="state-dot ok"></span>Running · health checks passed</dd><dt>Workspace</dt><dd class="mono">/workspaces/hermito</dd><dt>Image</dt><dd class="mono">ghcr.io/hermito/dev:rust-1.82</dd><dt>Authority route</dt><dd>Local → SSH → Devcontainer</dd><dt>Execution</dt><dd>Trusted; commands route through selected CURRENT node</dd></dl>
+                  <div class="surface-header"><h1>Lifecycle actions</h1></div>
+                  <div class="env-list"><button class="button primary" type="button" data-authority="container">Make current</button><button class="button" type="button" id="startNightly">Start rust-nightly</button><button class="button" type="button" data-open-trust>Review trust…</button></div>
+                </section>
+              </div>
+            </article>
+
+            <article class="view ports-view" data-view-panel="ports" aria-label="Port leases and discovery">
+              <div class="surface-header"><h1>Loopback port leases</h1><span class="chip">workspace scope</span><button class="button" type="button" id="discoverPorts">Discover listeners</button></div>
+              <table class="port-table"><thead><tr><th>Port</th><th>Binding</th><th>Owner</th><th>Source</th><th>State</th><th>Action</th></tr></thead><tbody>
+                <tr><td class="mono">3000</td><td class="mono">127.0.0.1:3000 → container:3000</td><td>web · pid 41872</td><td>Dev Container</td><td><span class="state-dot ok"></span>Leased</td><td><button class="button" type="button" data-copy="http://127.0.0.1:3000">Copy URL</button></td></tr>
+                <tr><td class="mono">9229</td><td class="mono">127.0.0.1:9229 → container:9229</td><td>node inspector · pid 41901</td><td>Auto-forward</td><td><span class="state-dot ok"></span>Leased</td><td><button class="button" type="button" data-copy="127.0.0.1:9229">Copy address</button></td></tr>
+                <tr><td class="mono">5432</td><td class="mono">127.0.0.1:5432</td><td>postgres · pid 872</td><td>Discovered locally</td><td><span class="state-dot warn"></span>Unmanaged</td><td><button class="button" type="button" id="leasePort">Create lease</button></td></tr>
+                <tr><td class="mono">8080</td><td class="mono">127.0.0.1:8080 → buildbox:8080</td><td>docs preview</td><td>SSH tunnel</td><td><span class="state-dot bad"></span>Host untrusted</td><td><button class="button" type="button" data-authority="ssh">Trust host…</button></td></tr>
+              </tbody></table>
+            </article>
+          </div>
+        </section>
+
+        <section class="bottom-window" id="bottomWindow" data-landmark aria-label="Bottom tool window">
+          <div class="bottom-header" role="tablist" aria-label="Bottom tools"><button class="bottom-tab" type="button" role="tab" aria-selected="true" data-bottom-tab="terminal">Terminal</button><button class="bottom-tab" type="button" role="tab" aria-selected="false" data-bottom-tab="problems">Problems <span class="chip warn">2</span></button><button class="bottom-tab" type="button" role="tab" aria-selected="false" data-bottom-tab="services">Services</button><div class="bottom-actions"><button class="button" id="captureToggle" type="button" aria-pressed="false">Capture input</button><button class="icon-button" id="closeBottom" type="button" aria-label="Close bottom tool window">×</button></div></div>
+          <pre class="bottom-panel terminal-output" id="terminalOutput" data-bottom-panel="terminal" tabindex="0" aria-label="Terminal output"><span class="prompt">local › hermito</span> cargo run -- workspace
+   Compiling hermito v0.4.0 (/Users/dev/Personal/Hermito)
+    Finished `dev` profile [unoptimized + debuginfo] in 1.38s
+     Running `target/debug/hermito workspace`
+[authority] local process boundary established
+[ports] leased 127.0.0.1:3000 → hermito-dev:3000
+[terminal] PTY ready · input pass-through disabled
+<span class="prompt">local › hermito</span> <span id="cursor">█</span></pre>
+          <div class="bottom-panel" data-bottom-panel="problems" role="tabpanel" hidden><ul class="bottom-list"><li><strong class="file-state conflict">ERROR</strong><span><strong>src/authority.rs:42</strong><br>Both branches changed execution authority resolution.</span><span>Open conflict</span></li><li><strong class="chip warn">WARN</strong><span><strong>src/terminal.rs:118</strong><br>PTY resize acknowledgement exceeded 250 ms.</span><span>Inspect service</span></li></ul></div>
+          <div class="bottom-panel" data-bottom-panel="services" role="tabpanel" hidden><ul class="bottom-list"><li><strong><span class="state-dot ok"></span>LSP</strong><span>rust-analyzer · workspace index ready</span><span>local</span></li><li><strong><span class="state-dot ok"></span>SSH</strong><span>buildbox host key verified; execution not trusted</span><span>inspect only</span></li><li><strong><span class="state-dot ok"></span>DEV</strong><span>hermito-dev · container healthy</span><span>running</span></li><li><strong><span class="state-dot warn"></span>PORT</strong><span>5432 discovered without a workspace lease</span><span>action required</span></li></ul></div>
+        </section>
+      </main>
+
+      <nav class="stripe right-stripe" data-landmark aria-label="Context tools"><button class="tool-button" id="contextToggle" type="button" aria-selected="false" title="Context [CX]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h16v14H4zM14 5v14M7 9h4M7 13h4"/></svg><span class="tool-label">Context</span></button><button class="tool-button" type="button" data-bottom-open="services" title="Services [SV]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="7" cy="7" r="3"/><circle cx="17" cy="7" r="3"/><circle cx="12" cy="17" r="3"/><path d="m9 9 2 5m4-5-2 5"/></svg><span class="tool-label">Services</span></button><div class="stripe-spacer"></div><button class="tool-button" type="button" id="helpButton" title="Keyboard help [?]"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.4 2.4 0 1 1 3.7 2c-1 .7-1.5 1.1-1.5 2.5M12 17h.01"/></svg><span class="tool-label">Keyboard help</span></button></nav>
+      <aside class="context-pane" id="contextPane" data-landmark aria-label="Workspace context">
+        <div class="pane-header"><h2>Context</h2><button class="icon-button" id="closeContext" type="button" aria-label="Collapse context pane">×</button></div>
+        <div class="pane-scroll"><div class="side-section"><div class="side-kicker">Current authority</div><strong id="contextAuthority">Local process</strong><div class="muted mono">uid 501 · cwd workspace root</div></div><div class="side-section"><div class="side-kicker">Run target</div><div class="context-row"><span class="state-dot ok"></span>cargo run</div><div class="context-row"><span class="state-dot"></span>cargo test</div><div class="context-row"><span class="state-dot"></span>docs preview</div></div><div class="side-section"><div class="side-kicker">Keyboard / ASCII fallback</div><div class="context-row"><kbd>Alt 1–4</kbd><span>PR / GT / EN / PT</span></div><div class="context-row"><kbd>F6</kbd><span>Next landmark</span></div><div class="context-row"><kbd>Esc</kbd><span>Close / release terminal</span></div><div class="context-row"><kbd>⌘K</kbd><span>Search or command</span></div></div></div>
+      </aside>
+    </div>
+
+    <footer class="status-bar" data-landmark aria-label="Status line"><span class="status-item"><strong id="statusView">Project</strong></span><span class="status-item optional">Git: feature/remote-authority</span><span class="status-item optional"><span class="state-dot warn"></span>2 conflicts</span><span class="status-spacer"></span><button class="status-button status-item" id="statusAuthority" type="button">Authority: Local</button><button class="status-button status-item" id="statusPorts" type="button" data-switch-view="ports">Ports: 2 leased</button><span class="status-item">LF · UTF-8</span></footer>
+  </div>
+
+  <div class="authority-popover" id="authorityMenu" role="menu" aria-label="Execution authority" hidden>
+    <button class="authority-button" type="button" role="menuitemradio" aria-checked="true" data-authority="local"><span class="state-dot ok"></span><span><strong>Local process</strong><br><span class="authority-meta">macOS · current user</span></span><kbd>safe</kbd></button>
+    <button class="authority-button" type="button" role="menuitemradio" aria-checked="false" data-authority="container"><span class="state-dot ok"></span><span><strong>hermito-dev</strong><br><span class="authority-meta">Dev Container · running</span></span><kbd>mounted</kbd></button>
+    <button class="authority-button" type="button" role="menuitemradio" aria-checked="false" data-authority="ssh"><span class="state-dot warn"></span><span><strong>buildbox</strong><br><span class="authority-meta">SSH · trust required</span></span><kbd>remote</kbd></button>
+  </div>
+
+  <dialog class="command-dialog" id="commandDialog" aria-labelledby="commandTitle"><div class="dialog-head" id="commandTitle">Search everywhere</div><div class="dialog-body"><input class="command-input" id="commandInput" type="search" autocomplete="off" placeholder="Type a view or command…" aria-controls="commandList"><ul class="command-list" id="commandList"><li><button class="command-option active" type="button" data-command="workspace"><span>Open Project editor</span><kbd>Alt 1</kbd></button></li><li><button class="command-option" type="button" data-command="git"><span>Open Git conflict editor</span><kbd>Alt 2</kbd></button></li><li><button class="command-option" type="button" data-command="environments"><span>Inspect execution environments</span><kbd>Alt 3</kbd></button></li><li><button class="command-option" type="button" data-command="ports"><span>Inspect port leases</span><kbd>Alt 4</kbd></button></li><li><button class="command-option" type="button" data-command="run"><span>Run current target through CURRENT authority</span><kbd>RUN</kbd></button></li><li><button class="command-option" type="button" data-command="terminal"><span>Toggle Terminal tool body</span><kbd>⌥F12</kbd></button></li></ul></div><div class="dialog-actions"><button class="button" type="button" data-close-dialog>Cancel</button></div></dialog>
+
+  <dialog id="trustDialog" aria-labelledby="trustTitle"><div class="dialog-head" id="trustTitle">Workspace trust</div><div class="dialog-body"><p><strong class="mono">Current authority: <span id="trustAuthorityLabel">Local process</span></strong></p><p>Trust allows tasks, terminals, Git mutations, lifecycle commands, and forwarding to execute in the selected authority. Revoking trust returns that authority to inspect-only mode.</p><p class="chip warn">Authority changes require an explicit decision</p></div><div class="dialog-actions"><button class="button" type="button" data-close-dialog>Cancel</button><button class="button danger" id="revokeTrust" type="button">Revoke trust</button><button class="button primary" id="confirmTrust" type="button">Grant trust</button></div></dialog>
+
+  <dialog id="destructiveDialog" aria-labelledby="destructiveTitle"><div class="dialog-head" id="destructiveTitle">Discard selected conflict hunk?</div><div class="dialog-body"><p>This removes the remote trust-guard changes from <span class="mono">src/authority.rs</span>. The operation cannot be undone from this prototype.</p></div><div class="dialog-actions"><button class="button" type="button" data-close-dialog>Cancel</button><button class="button danger" id="confirmDiscard" type="button">Discard hunk</button></div></dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const STORAGE_KEY = "hermito.workbench.v2";
+    const viewNames = { workspace: "Project", git: "Git", environments: "Environments", ports: "Ports" };
+    const viewFiles = { workspace: ["src", "authority.rs"], git: ["src", "authority.rs · conflict"], environments: [".devcontainer", "environment inspector"], ports: ["workspace", "port leases"] };
+    const defaultState = () => ({
+      view: "workspace",
+      toolOpen: true,
+      contextOpen: false,
+      bottomOpen: false,
+      bottomTab: "terminal",
+      authority: "local",
+      authorityTrust: { local: true, ssh: false, container: true },
+      editorScroll: { workspace: 0, git: 0, environments: 0, ports: 0 },
+      toolScroll: { workspace: 0, git: 0, environments: 0, ports: 0 }
+    });
+
+    function loadState() {
+      const fallback = defaultState();
+      try {
+        const restored = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+        if (!restored || typeof restored !== "object") return fallback;
+        return {
+          ...fallback,
+          ...restored,
+          authorityTrust: { ...fallback.authorityTrust, ...(restored.authorityTrust || {}) },
+          editorScroll: { ...fallback.editorScroll, ...(restored.editorScroll || {}) },
+          toolScroll: { ...fallback.toolScroll, ...(restored.toolScroll || {}) }
+        };
+      } catch {
+        return fallback;
+      }
+    }
+
+    const uiState = loadState();
+    const workbench = document.getElementById("workbench");
+    const editorStack = document.getElementById("editorStack");
+    const editorSurface = document.getElementById("editorSurface");
+    const toolScroll = document.querySelector(".tool-window .pane-scroll");
+    const toolButtons = [...document.querySelectorAll(".stripe [data-view]")];
+    const views = [...document.querySelectorAll("[data-view-panel]")];
+    const sidePanels = [...document.querySelectorAll("[data-side-view]")];
+    const toast = document.getElementById("toast");
+    const terminalOutput = document.getElementById("terminalOutput");
+    const authorityTrigger = document.getElementById("authorityTrigger");
+    const authorityMenu = document.getElementById("authorityMenu");
+    const authorityTrust = uiState.authorityTrust;
+    let currentView = viewNames[uiState.view] ? uiState.view : "workspace";
+    let previousFocus = null;
+    let pendingAuthority = null;
+    let authority = authorityTrust[uiState.authority] !== undefined ? uiState.authority : "local";
+    let terminalCaptured = false;
+    let toastTimer;
+    let saveTimer;
+
+    function saveState() {
+      uiState.view = currentView;
+      uiState.authority = authority;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(uiState));
+      } catch {
+        /* file:// privacy modes may disable storage; the first-run layout remains safe */
+      }
+    }
+
+    function scheduleSave() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(saveState, 120);
+    }
+
+    function announce(message) {
+      toast.textContent = message;
+      toast.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove("show"), 2600);
+    }
+
+    function rememberScroll() {
+      uiState.editorScroll[currentView] = editorSurface.scrollTop;
+      uiState.toolScroll[currentView] = toolScroll.scrollTop;
+    }
+
+    function restoreScroll(name) {
+      requestAnimationFrame(() => {
+        editorSurface.scrollTop = uiState.editorScroll[name] || 0;
+        toolScroll.scrollTop = uiState.toolScroll[name] || 0;
+      });
+    }
+
+    function switchView(name, focusTool = false, announceChange = true, openTool = false, rememberPrevious = true) {
+      if (!viewNames[name]) return;
+      if (rememberPrevious) rememberScroll();
+      currentView = name;
+      views.forEach(view => view.classList.toggle("active", view.dataset.viewPanel === name));
+      sidePanels.forEach(panel => { panel.hidden = panel.dataset.sideView !== name; });
+      toolButtons.forEach(button => button.setAttribute("aria-selected", String(button.dataset.view === name)));
+      document.getElementById("toolTitle").textContent = viewNames[name];
+      document.getElementById("statusView").textContent = viewNames[name];
+      document.getElementById("editorTabLabel").textContent = viewFiles[name][1];
+      document.getElementById("crumbArea").textContent = viewFiles[name][0];
+      document.getElementById("crumbCurrent").textContent = viewFiles[name][1];
+      if (openTool) toggleTool(true, false);
+      restoreScroll(name);
+      saveState();
+      if (focusTool) toolButtons.find(button => button.dataset.view === name)?.focus();
+      if (announceChange) announce(`${viewNames[name]} view selected`);
+    }
+
+    function toggleTool(forceOpen, announceChange = true) {
+      const collapsed = forceOpen === true ? false : forceOpen === false ? true : !workbench.classList.contains("tool-collapsed");
+      workbench.classList.toggle("tool-collapsed", collapsed);
+      document.getElementById("projectWidget").setAttribute("aria-expanded", String(!collapsed));
+      uiState.toolOpen = !collapsed;
+      saveState();
+      if (announceChange) announce(collapsed ? "Left tool window collapsed" : `${viewNames[currentView]} tool window expanded`);
+    }
+
+    function toggleContext(forceOpen, announceChange = true) {
+      const collapsed = forceOpen === true ? false : forceOpen === false ? true : !workbench.classList.contains("context-collapsed");
+      workbench.classList.toggle("context-collapsed", collapsed);
+      document.getElementById("contextToggle").setAttribute("aria-selected", String(!collapsed));
+      uiState.contextOpen = !collapsed;
+      saveState();
+      if (announceChange) announce(collapsed ? "Context pane collapsed" : "Context pane expanded");
+    }
+
+    function toggleBottom(forceOpen, announceChange = true) {
+      const collapsed = forceOpen === true ? false : forceOpen === false ? true : !editorStack.classList.contains("bottom-collapsed");
+      editorStack.classList.toggle("bottom-collapsed", collapsed);
+      document.getElementById("bottomToggle").setAttribute("aria-pressed", String(!collapsed));
+      uiState.bottomOpen = !collapsed;
+      if (collapsed && terminalCaptured) setTerminalCapture(false, false);
+      saveState();
+      if (announceChange) announce(collapsed ? "Bottom tool body collapsed; tabs remain available" : `${uiState.bottomTab} tool body expanded`);
+    }
+
+    function renderBottom(name) {
+      document.querySelectorAll("[data-bottom-tab]").forEach(tab => tab.setAttribute("aria-selected", String(tab.dataset.bottomTab === name)));
+      document.querySelectorAll("[data-bottom-panel]").forEach(panel => { panel.hidden = panel.dataset.bottomPanel !== name; });
+      document.getElementById("captureToggle").hidden = name !== "terminal";
+    }
+
+    function selectBottom(name, announceChange = true) {
+      if (!["terminal", "problems", "services"].includes(name)) return;
+      uiState.bottomTab = name;
+      renderBottom(name);
+      toggleBottom(true, false);
+      saveState();
+      if (announceChange) announce(`${name[0].toUpperCase() + name.slice(1)} tool selected`);
+    }
+
+    function openDialog(dialog) {
+      previousFocus = document.activeElement;
+      dialog.showModal();
+      requestAnimationFrame(() => dialog.querySelector("input, button")?.focus());
+    }
+
+    function closeDialog(dialog) {
+      if (dialog.open) dialog.close();
+      previousFocus?.focus();
+      previousFocus = null;
+    }
+
+    function closeAuthorityMenu(restoreFocus = false) {
+      authorityMenu.hidden = true;
+      authorityTrigger.setAttribute("aria-expanded", "false");
+      if (restoreFocus) authorityTrigger.focus();
+    }
+
+    function requestAuthority(next) {
+      closeAuthorityMenu();
+      if (!authorityTrust[next]) {
+        pendingAuthority = next;
+        document.getElementById("trustAuthorityLabel").textContent = next === "ssh" ? "SSH · buildbox" : "Dev Container · hermito-dev";
+        openDialog(document.getElementById("trustDialog"));
+        return;
+      }
+      setAuthority(next);
+    }
+
+    function setAuthority(next, announceChange = true) {
+      authority = next;
+      const labels = { local: ["Local · cargo run", "Authority: Local", "Local process"], ssh: ["buildbox · cargo run", "Authority: SSH", "SSH · buildbox"], container: ["hermito-dev · cargo run", "Authority: Devcontainer", "Dev Container · hermito-dev"] };
+      const trusted = authorityTrust[next];
+      document.getElementById("runTarget").textContent = labels[next][0];
+      document.getElementById("statusAuthority").textContent = labels[next][1];
+      document.getElementById("contextAuthority").textContent = labels[next][2];
+      document.getElementById("trustAuthorityLabel").textContent = labels[next][2];
+      document.getElementById("runButton").disabled = !trusted;
+      document.getElementById("trustState").textContent = trusted ? "[+] TRUSTED · execution granted" : "[!] INSPECT ONLY · execution blocked";
+      document.getElementById("trustStripButton").classList.toggle("inspect-only", !trusted);
+      document.querySelectorAll("[role='menuitemradio']").forEach(button => button.setAttribute("aria-checked", String(button.dataset.authority === next)));
+      document.querySelectorAll(".authority-segment").forEach(button => {
+        const current = button.dataset.authority === next;
+        button.setAttribute("aria-pressed", String(current));
+        button.querySelector(".segment-state").textContent = current ? "CURRENT" : (authorityTrust[button.dataset.authority] ? "TRUSTED" : "INSPECT ONLY");
+      });
+      saveState();
+      if (announceChange) announce(`CURRENT authority: ${labels[next][2]} · ${trusted ? "TRUSTED" : "INSPECT ONLY"}`);
+    }
+
+    function setTerminalCapture(captured, announceChange = true) {
+      terminalCaptured = captured;
+      terminalOutput.classList.toggle("capture", captured);
+      document.getElementById("captureToggle").setAttribute("aria-pressed", String(captured));
+      document.getElementById("captureToggle").textContent = captured ? "Release input (Esc)" : "Capture input";
+      if (captured) terminalOutput.focus();
+      if (announceChange) announce(captured ? "Terminal input captured. Press Escape to release." : "Terminal input released");
+    }
+
+    function runCurrent() {
+      if (!authorityTrust[authority]) {
+        announce(`Run blocked: ${authority} is INSPECT ONLY`);
+        return;
+      }
+      selectBottom("terminal", false);
+      terminalOutput.insertAdjacentText("beforeend", `\n[authority:${authority}] cargo run -- workspace\n`);
+      terminalOutput.scrollTop = terminalOutput.scrollHeight;
+      announce(`Run routed through CURRENT ${authority} authority`);
+    }
+
+    toolButtons.forEach(button => button.addEventListener("click", () => {
+      if (button.dataset.view === currentView) toggleTool(workbench.classList.contains("tool-collapsed") ? true : undefined);
+      else switchView(button.dataset.view, false, true, true);
+    }));
+    document.querySelectorAll("[data-switch-view]").forEach(button => button.addEventListener("click", () => switchView(button.dataset.switchView, false, true, true)));
+    document.querySelectorAll("[data-authority]").forEach(button => button.addEventListener("click", () => requestAuthority(button.dataset.authority)));
+    document.getElementById("projectWidget").addEventListener("click", () => toggleTool());
+    document.getElementById("collapseTool").addEventListener("click", () => toggleTool(false));
+    document.getElementById("contextToggle").addEventListener("click", () => toggleContext());
+    document.getElementById("closeContext").addEventListener("click", () => toggleContext(false));
+    document.getElementById("bottomToggle").addEventListener("click", () => toggleBottom());
+    document.getElementById("closeBottom").addEventListener("click", () => toggleBottom(false));
+    document.getElementById("captureToggle").addEventListener("click", () => setTerminalCapture(!terminalCaptured));
+    terminalOutput.addEventListener("dblclick", () => setTerminalCapture(true));
+    editorSurface.addEventListener("scroll", () => { uiState.editorScroll[currentView] = editorSurface.scrollTop; scheduleSave(); }, { passive: true });
+    toolScroll.addEventListener("scroll", () => { uiState.toolScroll[currentView] = toolScroll.scrollTop; scheduleSave(); }, { passive: true });
+
+    authorityTrigger.addEventListener("click", () => {
+      authorityMenu.hidden = !authorityMenu.hidden;
+      authorityTrigger.setAttribute("aria-expanded", String(!authorityMenu.hidden));
+      if (!authorityMenu.hidden) authorityMenu.querySelector("[aria-checked='true']")?.focus();
+    });
+
+    document.getElementById("commandTrigger").addEventListener("click", () => openDialog(document.getElementById("commandDialog")));
+    document.querySelectorAll("[data-open-trust]").forEach(button => button.addEventListener("click", () => openDialog(document.getElementById("trustDialog"))));
+    document.getElementById("discardHunk").addEventListener("click", () => openDialog(document.getElementById("destructiveDialog")));
+    document.querySelectorAll("[data-close-dialog]").forEach(button => button.addEventListener("click", () => closeDialog(button.closest("dialog"))));
+    document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("cancel", event => { event.preventDefault(); closeDialog(dialog); }));
+    document.getElementById("confirmTrust").addEventListener("click", () => {
+      const next = pendingAuthority || authority;
+      authorityTrust[next] = true;
+      uiState.authorityTrust = authorityTrust;
+      closeDialog(document.getElementById("trustDialog"));
+      setAuthority(next);
+      pendingAuthority = null;
+    });
+    document.getElementById("revokeTrust").addEventListener("click", () => {
+      authorityTrust[authority] = false;
+      uiState.authorityTrust = authorityTrust;
+      closeDialog(document.getElementById("trustDialog"));
+      setAuthority(authority);
+    });
+    document.getElementById("confirmDiscard").addEventListener("click", () => {
+      closeDialog(document.getElementById("destructiveDialog"));
+      document.getElementById("discardHunk").disabled = true;
+      document.getElementById("editorFileState").textContent = "×";
+      announce("Conflict hunk discarded; working tree updated");
+    });
+    document.getElementById("acceptHunk").addEventListener("click", event => {
+      event.currentTarget.disabled = true;
+      document.getElementById("editorFileState").textContent = "✓";
+      announce("Remote hunk accepted with trust guard");
+    });
+
+    document.getElementById("runButton").addEventListener("click", runCurrent);
+    document.getElementById("refreshEnvironments").addEventListener("click", () => announce("Environment status refreshed"));
+    document.getElementById("startNightly").addEventListener("click", event => { event.currentTarget.textContent = "Starting…"; event.currentTarget.disabled = true; announce("rust-nightly container lifecycle started"); });
+    document.getElementById("discoverPorts").addEventListener("click", () => announce("Listener discovery complete: 3 loopback listeners"));
+    document.getElementById("leasePort").addEventListener("click", event => { event.currentTarget.textContent = "Leased"; event.currentTarget.disabled = true; document.getElementById("statusPorts").textContent = "Ports: 3 leased"; announce("Port 5432 leased to this workspace"); });
+    document.querySelectorAll("[data-copy]").forEach(button => button.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy);
+        announce(`${button.dataset.copy} copied`);
+      } catch {
+        announce(`Copy unavailable on file URL; value: ${button.dataset.copy}`);
+      }
+    }));
+    document.getElementById("helpButton").addEventListener("click", () => announce("Alt+1–4: PR/GT/EN/PT · F6: landmarks · Esc: close/release · ⌘K: command"));
+    document.getElementById("statusAuthority").addEventListener("click", () => authorityTrigger.click());
+    document.querySelectorAll("[data-bottom-open]").forEach(button => button.addEventListener("click", () => selectBottom(button.dataset.bottomOpen)));
+    document.querySelectorAll("[data-bottom-tab]").forEach(button => button.addEventListener("click", () => selectBottom(button.dataset.bottomTab)));
+
+    const commandInput = document.getElementById("commandInput");
+    const commandOptions = [...document.querySelectorAll(".command-option")];
+    commandInput.addEventListener("input", () => {
+      const query = commandInput.value.toLowerCase();
+      commandOptions.forEach(option => { option.closest("li").hidden = !option.textContent.toLowerCase().includes(query); });
+      commandOptions.forEach(option => option.classList.remove("active"));
+      commandOptions.find(option => !option.closest("li").hidden)?.classList.add("active");
+    });
+    commandOptions.forEach(option => option.addEventListener("click", () => {
+      closeDialog(document.getElementById("commandDialog"));
+      if (option.dataset.command === "terminal") toggleBottom();
+      else if (option.dataset.command === "run") runCurrent();
+      else switchView(option.dataset.command, true, true, true);
+    }));
+
+    document.addEventListener("click", event => {
+      if (!authorityMenu.hidden && !authorityMenu.contains(event.target) && !authorityTrigger.contains(event.target)) closeAuthorityMenu();
+    });
+
+    document.addEventListener("keydown", event => {
+      if (event.key === "Escape" && terminalCaptured && !document.querySelector("dialog[open]")) { event.preventDefault(); setTerminalCapture(false); return; }
+      if (event.key === "Escape" && !authorityMenu.hidden) { event.preventDefault(); closeAuthorityMenu(true); return; }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); openDialog(document.getElementById("commandDialog")); return; }
+      if (event.altKey && ["1", "2", "3", "4"].includes(event.key)) { event.preventDefault(); switchView(["workspace", "git", "environments", "ports"][Number(event.key) - 1], true, true, true); return; }
+      if (event.altKey && event.key === "F12") { event.preventDefault(); selectBottom("terminal"); return; }
+      if (event.key === "F6") {
+        event.preventDefault();
+        const landmarks = [...document.querySelectorAll("[data-landmark]")].filter(node => node.offsetParent !== null);
+        const index = landmarks.indexOf(document.activeElement.closest?.("[data-landmark]"));
+        const delta = event.shiftKey ? -1 : 1;
+        const target = landmarks[(index + delta + landmarks.length) % landmarks.length];
+        if (!target.hasAttribute("tabindex")) target.tabIndex = -1;
+        target.focus();
+        announce(`${target.getAttribute("aria-label") || "Workbench"} focused`);
+      }
+    });
+
+    document.querySelector(".stripe").addEventListener("keydown", event => {
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      const buttons = [...event.currentTarget.querySelectorAll("button")];
+      const index = buttons.indexOf(document.activeElement);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+      event.preventDefault();
+      buttons[next].focus();
+    });
+
+    workbench.classList.toggle("tool-collapsed", !uiState.toolOpen);
+    workbench.classList.toggle("context-collapsed", !uiState.contextOpen);
+    editorStack.classList.toggle("bottom-collapsed", !uiState.bottomOpen);
+    document.getElementById("projectWidget").setAttribute("aria-expanded", String(uiState.toolOpen));
+    document.getElementById("contextToggle").setAttribute("aria-selected", String(uiState.contextOpen));
+    document.getElementById("bottomToggle").setAttribute("aria-pressed", String(uiState.bottomOpen));
+    renderBottom(uiState.bottomTab);
+    setAuthority(authority, false);
+    switchView(currentView, false, false, false, false);
+  </script>
+</body>
+</html>
