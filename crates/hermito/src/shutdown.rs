@@ -44,7 +44,7 @@ pub fn register_shutdown(
     }
     #[cfg(windows)]
     {
-        unsafe extern "system" fn handler(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
+        unsafe extern "system" fn handler(ctrl_type: u32) -> windows_sys::core::BOOL {
             if ctrl_type == windows_sys::Win32::System::Console::CTRL_C_EVENT
                 || ctrl_type == windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT
             {

@@ -10,6 +10,7 @@ pub enum Action {
     CycleLandmarkForward,
     CycleLandmarkBackward,
     FocusLandmark(Landmark),
+    CycleAuthority,
 
     // Within-landmark / modal (Tab / Shift+Tab)
     NextControl,
@@ -62,6 +63,10 @@ pub enum Action {
     },
 
     // Terminal
+    OpenTerminal,
+    TerminalInput(Vec<u8>),
+    ReleaseTerminalCapture,
+    CloseTerminal,
     TerminalResize {
         width: u16,
         height: u16,
@@ -73,6 +78,9 @@ pub enum Action {
     GrantTrust,  // ONLY when modal grant button focused + Enter
     RevokeTrust, // immediate
     CancelModal, // Esc - restores invoker focus, no state change
+    SshPassphraseInput(char),
+    SshPassphraseBackspace,
+    SshPassphraseSubmit,
 
     JournalAck {
         doc_id: DocumentId,

@@ -1,5 +1,6 @@
 pub mod action;
 pub mod app;
+pub mod authority;
 pub mod buffer;
 pub mod config;
 pub mod coordinate;
@@ -10,7 +11,10 @@ pub mod first_run;
 pub mod input;
 pub mod layout;
 pub mod persistence;
+pub mod process;
 pub mod project;
+pub mod pty;
+pub mod remote;
 pub mod shutdown;
 pub mod syntax;
 pub mod terminal;

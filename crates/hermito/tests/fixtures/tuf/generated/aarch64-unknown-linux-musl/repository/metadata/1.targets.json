@@ -1,0 +1,26 @@
+{
+  "signed": {
+    "_type": "targets",
+    "spec_version": "1.0.0",
+    "version": 1,
+    "expires": "2030-01-01T00:00:00Z",
+    "targets": {
+      "hermito-remote-aarch64-unknown-linux-musl": {
+        "length": 1442616,
+        "hashes": {
+          "sha256": "c78cf9487b6c3d4ce1ada8804637885ffb302b6de86f600e5cfb5585b9946c47"
+        }
+      }
+    },
+    "delegations": {
+      "keys": {},
+      "roles": []
+    }
+  },
+  "signatures": [
+    {
+      "keyid": "fce11fcaa78b4f8e5ac453e5d43a0d34c9f744acee38820fe628380dad8e2543",
+      "sig": "3a093cfcb5a81765f8c2b33b2b56c0fae599e6174bf108f8537834ccd01412da42cc480ba2ba6b5dc499c626a4807fd67006b0680948013a0b4ca6bab7ab3e399d8009de6c7b9087c46ad01583cb02aebf16dbcd99a4a3da8c79f3aedd48e6507a785b8e76e17742194bc57b1062b527fc231f8d79d0f8d620832cff6a83ce5b177ee2ecbb0fe046c8edc83134bb3a4211c0953c3e93b5f45cdb6db8e98bc6eaafad73c08ba12d90dac37e745c6093c038d276ae2b0aa87f9724f844eb3bc3bbfeef90c07335a83f5a4513b0b0e309dce74c1969e24a465613ccc65e5d5b056197ab5dcf863d3001a3d27a85bc0918e6418ca255afe55bfa67f4c944a0df8de1"
+    }
+  ]
+}

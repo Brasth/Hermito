@@ -51,6 +51,8 @@ pub struct TabMetadata {
 pub struct TrustRecord {
     pub workspace_root: PathBuf,
     pub authority: String,
+    #[serde(default = "default_authority_kind")]
+    pub kind: String,
     pub level: String,
 }
 
@@ -61,6 +63,9 @@ impl Default for AppState {
 }
 fn default_focus() -> String {
     "Editor".to_string()
+}
+fn default_authority_kind() -> String {
+    "local".to_string()
 }
 
 /// Exact first-run layout + trust per phase-01 contract and design-guidelines.
@@ -86,6 +91,7 @@ pub fn first_run_state() -> AppState {
         trust: vec![TrustRecord {
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             authority: "local".to_string(),
+            kind: "local".to_string(),
             level: "inspect_only".to_string(),
         }],
     }

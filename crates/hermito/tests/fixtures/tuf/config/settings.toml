@@ -1,0 +1,14 @@
+# TEST-ONLY TUF repository configuration. Never use these keys or this root in production.
+tuftool_version = "0.17.0"
+root_version = 1
+root_expires = "2035-01-01T00:00:00Z"
+targets_version = 1
+targets_expires = "2030-01-01T00:00:00Z"
+snapshot_version = 1
+snapshot_expires = "2030-01-01T00:00:00Z"
+timestamp_version = 1
+timestamp_expires = "2030-01-01T00:00:00Z"
+root_threshold = 1
+targets_threshold = 1
+snapshot_threshold = 1
+timestamp_threshold = 1

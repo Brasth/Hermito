@@ -1,22 +1,22 @@
 # Hermito Technology Stack
 
 **Status:** Approved
-**Date:** 2026-07-29
+**Date:** 2026-07-30
 **License:** Apache-2.0
 
 ## Product Contract
 
 Hermito: conventional terminal IDE for native macOS, Linux, Windows.
 
-First-release scope:
+First-release scope (phased):
 - Mouse click, drag selection, wheel scroll, keyboard-complete UX
-- Host and Dev Container terminals
-- Local and SSH-remote workspaces
-- Managed versioned remote helper
-- Docker and Podman Dev Containers
-- True container-localhost TCP forwarding
-- Certified TypeScript/JavaScript, Rust, Go, Python LSP workflows
-- Advanced Git: partial staging, graph, stash, conflicts, cherry-pick, rebase, worktrees, changelists
+- Host terminals (Phase 2 local+SSH PTY); Dev Container terminals (future)
+- Local and SSH-remote workspaces (Phase 2)
+- Managed versioned remote helper (Phase 2)
+- Docker and Podman Dev Containers (future)
+- True container-localhost TCP forwarding (future)
+- Certified TypeScript/JavaScript, Rust, Go, Python LSP workflows (future)
+- Advanced Git (future)
 - Configuration-only extensibility
 - No debugger or hosting-provider PR integration
 
@@ -34,14 +34,15 @@ First-release scope:
 | Local PTY | portable-pty | Unix PTY and Windows ConPTY adapter |
 | Terminal emulation | Replaceable `TerminalSurface`; evaluate vt100 | Parse child bytes into inert cell state |
 | Remote transport | Installed OpenSSH `ssh`/`sftp`/`ssh-keyscan` | Strict host-key enrollment/pinning; no ambient executable SSH config |
-| Remote services | TUF-verified static `hermito-remote` | `session` and `container-agent` modes; canonical files/PTY/Git/LSP/Container/Relay multiplexing; Linux musl x86_64/aarch64 only |
+| Remote services | TUF-verified static `hermito-remote` | Phase 2: session mode for PTY/FS/Process (hermito-protocol); `container-agent` + Git/LSP/Container/Relay future (Phases 3-6); Linux musl x86_64/aarch64 only |
 | Helper updates | Full-chain TUF targets | Threshold roles, length/hash/version/expiry, durable rollback/freeze floors, atomic digest-addressed install |
-| Dev Containers | Pinned external Dev Container CLI | Spec resolution, Features, lifecycle, build/up/exec |
-| Engine lifecycle | Narrow Hermito Docker/Podman adapters | Inspect/list/stop/remove/log plus fixed verified-agent copy/hash/lease controls only; never create/build/publish/general exec |
-| Git | Authority-local system Git | Direct argv; porcelain v2/NUL/plumbing contracts |
-| Forwarding | Host loopback broker + remote hop + container relay | TCP only; no publishing substitution |
+| Dev Containers | Pinned external Dev Container CLI (future Phase 5) | Spec resolution, Features, lifecycle, build/up/exec |
+| Engine lifecycle | Narrow Hermito Docker/Podman adapters (future) | Inspect/list/stop/remove/log plus fixed verified-agent copy/hash/lease controls only; never create/build/publish/general exec |
+| Git | Authority-local system Git (Phase 4 future for advanced) | Direct argv; porcelain v2/NUL/plumbing contracts |
+| Forwarding | Host loopback broker + remote hop + container relay (future Phase 6) | TCP only; no publishing substitution |
 | Configuration | TOML | Themes, keybindings, tasks, language servers, layouts |
 | Persistent metadata | Versioned app-state records | Trust, sessions, port leases, IDE changelists |
+
 
 ## Architecture Rules
 
@@ -52,9 +53,9 @@ First-release scope:
 5. Remote/local/container execution uses one typed authority abstraction; never local Git on remote paths.
 6. Raw PTY bytes never reach the outer host terminal.
 7. Subprocesses use direct argument vectors, fixed working directory, bounded output, and owned cancellation.
-8. Docker is the reference engine path. Podman ships only after its full matrix passes.
+8. Docker is the reference engine path (future Phase 5). Podman ships only after its full matrix passes.
 9. Untrusted workspaces are inspect/edit only; executable capabilities require explicit grants.
-10. Forwarded ports bind only `127.0.0.1` and `::1`.
+10. Forwarded ports bind only `127.0.0.1` and `::1` (future Phase 6).
 
 ## External Tool Policy
 
@@ -71,21 +72,22 @@ Hermito reports exact missing or incompatible capabilities. It never silently do
 
 - Native macOS and Linux
 - Native Windows with ConPTY; no WinPTY fallback
-- Local Docker Engine/Desktop
+- Local Docker Engine/Desktop (future qualification)
 - Local Podman, Podman machine/Desktop only after qualification
 - First-release helper targets: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`; unsupported remote/container architectures fail closed
 - xterm-256color terminal profile; unsupported VT extensions remain inert
 
 ## Release-Blocking Gates
 
-- Terminal restoration and process-tree cleanup on all platforms
+- Terminal restoration and process-tree cleanup on all platforms (Phase 2)
 - Exact Unicode/grapheme/display-cell/LSP position conversions
-- Managed helper verification, host-key pinning, version negotiation, rollback protection
-- Docker and Podman Dev Container fixture matrices
-- Container-localhost forwarding without public listeners
-- Git recovery after cancel, crash, SSH loss, conflict, and interrupted sequences
+- Managed helper verification, host-key pinning, version negotiation, rollback protection (Phase 2)
+- Docker and Podman Dev Container fixture matrices (future)
+- Container-localhost forwarding without public listeners (future)
+- Git recovery after cancel, crash, SSH loss, conflict, and interrupted sequences (future)
 - No implicit credential, agent, host environment, engine socket, or host mount exposure
-- No raw PTY/LSP/Git escape sequence can affect the host terminal
+- No raw PTY/LSP/Git escape sequence can affect the host terminal (Phase 2 PTY path)
+
 
 ## Rejected Foundations
 
@@ -98,7 +100,7 @@ Hermito reports exact missing or incompatible capabilities. It never silently do
 
 ## Version Policy
 
-Pin every direct Rust dependency and grammar set through the lockfile. Pin and capability-probe external protocol/tool baselines. Record tool versions in diagnostics. Upgrade only after platform and fixture matrices pass.
+Pin every direct Rust dependency and grammar set through the lockfile. Pin hermito-protocol (Phase 2) and capability-probe external tool baselines. Record tool versions in diagnostics. Upgrade only after platform and fixture matrices pass.
 
 ## Unresolved Questions
 

@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: "Terminal and Execution Transport"
-status: pending
+status: completed
 priority: P1
 dependencies: ["phase-01-core-workbench-and-editor"]
 effort: "L"

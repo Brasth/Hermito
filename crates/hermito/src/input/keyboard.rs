@@ -35,6 +35,16 @@ pub fn map_key(key: KeyEvent, snapshot: &AppSnapshot) -> Option<Action> {
         };
     }
 
+    if let crate::app::OverlaySnapshot::SshPassphrase { .. } = &snapshot.overlay {
+        return match key.code {
+            KeyCode::Char(character) => Some(Action::SshPassphraseInput(character)),
+            KeyCode::Backspace => Some(Action::SshPassphraseBackspace),
+            KeyCode::Enter => Some(Action::SshPassphraseSubmit),
+            KeyCode::Esc => Some(Action::CancelModal),
+            _ => None,
+        };
+    }
+
     if let crate::app::OverlaySnapshot::CommandPalette { .. } = &snapshot.overlay {
         return match key.code {
             KeyCode::Tab | KeyCode::Down => Some(Action::NextControl),
@@ -56,6 +66,16 @@ pub fn map_key(key: KeyEvent, snapshot: &AppSnapshot) -> Option<Action> {
         };
     }
 
+    if matches!(key.code, KeyCode::Char('`')) && is_ctrl_or_cmd {
+        return Some(Action::OpenTerminal);
+    }
+    if snapshot.terminal.captured {
+        if key.code == KeyCode::Esc {
+            return Some(Action::ReleaseTerminalCapture);
+        }
+        return terminal_key_bytes(key).map(Action::TerminalInput);
+    }
+
     match key.code {
         KeyCode::F(6) => {
             if mods.contains(KeyModifiers::SHIFT) {
@@ -64,6 +84,7 @@ pub fn map_key(key: KeyEvent, snapshot: &AppSnapshot) -> Option<Action> {
                 Some(Action::CycleLandmarkForward)
             }
         }
+        KeyCode::F(7) => Some(Action::CycleAuthority),
         KeyCode::Tab => Some(Action::NextControl),
         KeyCode::BackTab => Some(Action::PrevControl),
         KeyCode::Char('1') if mods.contains(KeyModifiers::ALT) => Some(Action::ActivateLeftTool(1)),
@@ -155,4 +176,39 @@ pub fn map_key(key: KeyEvent, snapshot: &AppSnapshot) -> Option<Action> {
         }),
         _ => None,
     }
+}
+
+fn terminal_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(8);
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        bytes.push(0x1b);
+    }
+    match key.code {
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if character.is_ascii() {
+                bytes.push((character.to_ascii_uppercase() as u8) & 0x1f);
+            } else {
+                return None;
+            }
+        }
+        KeyCode::Char(character) => {
+            let mut encoded = [0_u8; 4];
+            bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        }
+        KeyCode::Enter => bytes.push(b'\r'),
+        KeyCode::Backspace => bytes.push(0x7f),
+        KeyCode::Tab => bytes.push(b'\t'),
+        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
+        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
+        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
+        _ => return None,
+    }
+    Some(bytes)
 }

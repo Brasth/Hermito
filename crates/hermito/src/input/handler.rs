@@ -8,9 +8,11 @@ use crossterm::event::Event;
 pub fn handle_event(event: Event, snapshot: &AppSnapshot) -> Vec<Action> {
     let mut out = Vec::with_capacity(2);
 
-    // Paste (bracketed) -> editor paste when appropriate
+    // Paste is routed only to the currently captured input surface.
     if let Some(text) = adapter::as_paste(&event) {
-        if snapshot.focus == crate::layout::Landmark::Editor {
+        if snapshot.terminal.captured {
+            out.push(Action::TerminalInput(text.into_bytes()));
+        } else if snapshot.focus == crate::layout::Landmark::Editor {
             out.push(Action::EditorPaste(text));
         }
         return out;
@@ -25,15 +27,18 @@ pub fn handle_event(event: Event, snapshot: &AppSnapshot) -> Vec<Action> {
         return out;
     }
 
-    // Quit (Ctrl-C etc handled by runtime; explicit here for Ctrl-Q)
-    if let Event::Key(k) = &event {
-        if (k.code == crossterm::event::KeyCode::Char('c')
-            || k.code == crossterm::event::KeyCode::Char('q'))
-            && k.modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-        {
-            out.push(Action::Quit);
-            return out;
+    // Global quit shortcuts apply only outside terminal capture. Captured control
+    // keys, including Ctrl-C, are bytes for the child process.
+    if !snapshot.terminal.captured {
+        if let Event::Key(k) = &event {
+            if (k.code == crossterm::event::KeyCode::Char('c')
+                || k.code == crossterm::event::KeyCode::Char('q'))
+                && k.modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                out.push(Action::Quit);
+                return out;
+            }
         }
     }
 
