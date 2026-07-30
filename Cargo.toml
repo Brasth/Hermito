@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/hermito"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
+directories = "6.0"
+futures-util = "0.3"
+ignore = "0.4"
+ratatui = { version = "0.30.2", features = ["crossterm"] }
+ropey = "1.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tree-sitter = "0.26"
+tree-sitter-go = "0.25"
+tree-sitter-highlight = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

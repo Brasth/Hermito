@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title desc">
+  <title id="title">Hermito mark</title>
+  <desc id="desc">A geometric H forming an open terminal portal.</desc>
+  <path fill="#D8A84E" fill-rule="evenodd" d="M5 5h14v13h10V5h14v38H29V30H19v13H5V5Zm6 6v26h2V24h22v13h2V11h-2v13H13V11h-2Z"/>
+  <path fill="#6FA9AD" d="M21 21h6v6h-6z"/>
+</svg>
