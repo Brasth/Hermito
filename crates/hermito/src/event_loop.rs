@@ -15,6 +15,15 @@ use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const QUALIFIED_REMOTE_HELPER_TARGETS: [&str; 2] = [
+    "hermito-remote-x86_64-unknown-linux-musl",
+    "hermito-remote-aarch64-unknown-linux-musl",
+];
+
+fn is_qualified_remote_helper_target(target: &str) -> bool {
+    QUALIFIED_REMOTE_HELPER_TARGETS.contains(&target)
+}
+
 /// Result of off-thread atomic file save. Only success + exact rev/epoch match will mark clean + Saved + compact.
 struct SaveResult {
     epoch: WorkspaceEpoch,
@@ -22,6 +31,157 @@ struct SaveResult {
     revision: DocumentRevision,
     path: std::path::PathBuf,
     success: bool,
+}
+
+struct TerminalStartResult {
+    epoch: WorkspaceEpoch,
+    launch_id: u64,
+    authority_label: String,
+    result: Result<crate::pty::PtySession, String>,
+}
+
+#[derive(Clone)]
+struct ConfiguredSshRuntime {
+    authority: Arc<crate::authority::ssh::SshAuthority>,
+    bootstrap: crate::remote::ssh_bootstrap::SshBootstrap,
+    verifier: Arc<crate::authority::tuf_verifier::TufVerifier>,
+    host_fingerprint: String,
+    helper_target: String,
+    remote_helper_directory: std::path::PathBuf,
+    passphrase_required: bool,
+}
+
+struct SshActivationResult {
+    epoch: WorkspaceEpoch,
+    label: String,
+    result: Result<(), String>,
+}
+
+fn configured_ssh_runtime(
+    config: crate::config::SshAuthorityConfig,
+    epoch: WorkspaceEpoch,
+) -> anyhow::Result<(String, ConfiguredSshRuntime)> {
+    let label = config.label.clone();
+    if label.is_empty() || label.len() > 64 {
+        anyhow::bail!("SSH authority label must contain 1..=64 bytes");
+    }
+    if !config.host_fingerprint.starts_with("SHA256:")
+        || config.host_fingerprint.len() <= "SHA256:".len()
+    {
+        anyhow::bail!("SSH authority requires an explicit SHA256 host fingerprint");
+    }
+    if !is_qualified_remote_helper_target(&config.helper_target) {
+        anyhow::bail!(
+            "SSH helper target is not a qualified Phase 2 artifact: {}",
+            config.helper_target
+        );
+    }
+    for (name, path) in [
+        ("TUF trusted root", &config.tuf_trusted_root),
+        ("TUF datastore", &config.tuf_datastore),
+        ("TUF target cache", &config.tuf_target_cache),
+    ] {
+        if !path.is_absolute() {
+            anyhow::bail!("{name} must be absolute");
+        }
+    }
+    let bootstrap = crate::remote::ssh_bootstrap::SshBootstrap::new(
+        crate::remote::ssh_bootstrap::SshTarget {
+            host: config.host,
+            port: config.port,
+            user: config.user,
+        },
+        crate::remote::ssh_identity::SshIdentity {
+            private_key: config.identity,
+            certificate: config.certificate,
+        },
+        crate::persistence::config_dir().join("known_hosts"),
+    )?;
+    let authority = crate::authority::ssh::SshAuthority::new(
+        label.clone(),
+        config.root,
+        bootstrap.clone(),
+        hermito_protocol::WorkspaceEpoch(epoch.0),
+    )?;
+    let verifier =
+        crate::authority::tuf_verifier::TufVerifier::new(crate::remote::tuf::TufPolicy {
+            trusted_root: config.tuf_trusted_root,
+            metadata_base_url: url::Url::parse(&config.tuf_metadata_url)?,
+            targets_base_url: url::Url::parse(&config.tuf_targets_url)?,
+            datastore: config.tuf_datastore,
+            target_cache: config.tuf_target_cache,
+            offline_metadata_url: None,
+            offline_targets_url: None,
+            allow_offline_cache: false,
+            max_target_bytes: 64 * 1024 * 1024,
+        })?;
+    Ok((
+        label,
+        ConfiguredSshRuntime {
+            authority,
+            bootstrap,
+            verifier: Arc::new(verifier),
+            host_fingerprint: config.host_fingerprint,
+            helper_target: config.helper_target,
+            remote_helper_directory: config.remote_helper_directory,
+            passphrase_required: config.passphrase_required,
+        },
+    ))
+}
+
+async fn activate_configured_ssh(
+    runtime: ConfiguredSshRuntime,
+    passphrase: Option<zeroize::Zeroizing<Vec<u8>>>,
+) -> Result<(), String> {
+    let candidates = runtime
+        .bootstrap
+        .scan_host_keys()
+        .await
+        .map_err(|error| error.to_string())?;
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.fingerprint == runtime.host_fingerprint)
+        .ok_or_else(|| {
+            format!(
+                "SSH host did not present configured fingerprint {}",
+                runtime.host_fingerprint
+            )
+        })?;
+    crate::config::known_hosts::KnownHostsStore::new(runtime.bootstrap.known_hosts.clone())
+        .accept(
+            &runtime.bootstrap.target.host,
+            runtime.bootstrap.target.port,
+            candidate,
+            &runtime.host_fingerprint,
+        )
+        .map_err(|error| error.to_string())?;
+    runtime
+        .authority
+        .activate(
+            runtime.verifier.as_ref(),
+            &runtime.helper_target,
+            runtime.remote_helper_directory,
+            passphrase.as_ref(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn dispatch_ssh_activation(
+    label: String,
+    epoch: WorkspaceEpoch,
+    runtime: ConfiguredSshRuntime,
+    passphrase: Option<zeroize::Zeroizing<Vec<u8>>>,
+    tx: std::sync::mpsc::SyncSender<SshActivationResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = activate_configured_ssh(runtime, passphrase).await;
+        let _ = tx.send(SshActivationResult {
+            epoch,
+            label,
+            result,
+        });
+    })
 }
 const TICK_MS: u64 = 16;
 
@@ -241,6 +401,106 @@ fn spawn_project_file_read(
     });
 }
 
+fn spawn_local_terminal(
+    root: std::path::PathBuf,
+    epoch: WorkspaceEpoch,
+    launch_id: u64,
+    rows: u16,
+    cols: u16,
+    tx: std::sync::mpsc::SyncSender<TerminalStartResult>,
+) {
+    std::thread::spawn(move || {
+        use crate::authority::{
+            types::{AuthorityRequest, PtyRequest},
+            Authority,
+        };
+        let result = (|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            let authority = crate::authority::local::LocalAuthority::new(
+                "host",
+                root.clone(),
+                hermito_protocol::WorkspaceEpoch(epoch.0),
+            )
+            .map_err(|error| error.to_string())?;
+            authority.grant_execution();
+            let command = crate::pty::default_shell_command(&root);
+            let request = AuthorityRequest::new(
+                PtyRequest {
+                    command,
+                    size: portable_pty::PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                },
+                hermito_protocol::WorkspaceEpoch(epoch.0),
+                hermito_protocol::EnvironmentEpoch(0),
+                None,
+            );
+            let opened = runtime
+                .block_on(authority.spawn_pty(request, tokio_util::sync::CancellationToken::new()))
+                .map_err(|error| error.to_string())?;
+            Ok(opened.payload)
+        })();
+        let _ = tx.send(TerminalStartResult {
+            epoch,
+            launch_id,
+            authority_label: "host".into(),
+            result,
+        });
+    });
+}
+
+fn spawn_remote_terminal(
+    epoch: WorkspaceEpoch,
+    launch_id: u64,
+    authority_label: String,
+    authority: Arc<crate::authority::ssh::SshAuthority>,
+    request: crate::authority::types::AuthorityRequest<crate::authority::types::PtyRequest>,
+    tx: std::sync::mpsc::SyncSender<TerminalStartResult>,
+) {
+    use crate::authority::Authority;
+    tokio::spawn(async move {
+        let result = authority
+            .spawn_pty(request, tokio_util::sync::CancellationToken::new())
+            .await
+            .map(|opened| opened.payload)
+            .map_err(|error| error.to_string());
+        let _ = tx.send(TerminalStartResult {
+            epoch,
+            launch_id,
+            authority_label,
+            result,
+        });
+    });
+}
+
+fn dispatch_terminal_start(
+    spec: crate::app::TerminalSpawnSpec,
+    tx: std::sync::mpsc::SyncSender<TerminalStartResult>,
+) {
+    match spec {
+        crate::app::TerminalSpawnSpec::Local {
+            root,
+            epoch,
+            launch_id,
+            rows,
+            cols,
+        } => spawn_local_terminal(root, epoch, launch_id, rows, cols, tx),
+        crate::app::TerminalSpawnSpec::Remote {
+            epoch,
+            launch_id,
+            authority_label,
+            authority,
+            request,
+        } => spawn_remote_terminal(epoch, launch_id, authority_label, authority, request, tx),
+    }
+}
+
 pub fn run_event_loop(
     guard: &mut TerminalGuard,
     journal: JournalHandle,
@@ -262,6 +522,18 @@ pub fn run_event_loop(
 
     // restore uses journal recovery (pre layout) + validated state for layout/trust/tabs/cursor/scroll
     let mut app = App::restore_state(initial_state, recovery, journal.clone());
+    let mut configured_ssh = std::collections::HashMap::new();
+    for config in crate::config::load()?.ssh_authorities {
+        let configured_label = config.label.clone();
+        let (label, runtime) = configured_ssh_runtime(config, app.epoch).map_err(|error| {
+            anyhow::anyhow!("invalid SSH authority {configured_label}: {error}")
+        })?;
+        if configured_ssh.contains_key(&label) {
+            anyhow::bail!("duplicate SSH authority label {label}");
+        }
+        app.register_ssh_authority(Arc::clone(&runtime.authority));
+        configured_ssh.insert(label, runtime);
+    }
     // Before first snapshot/draw, resize from actual terminal size (not the 120x36 default).
     // This ensures WorkbenchLayout rects (incl. editor reserving bottom header) are correct on first frame
     // and match mouse hit testing at the real size.
@@ -294,12 +566,53 @@ pub fn run_event_loop(
     let (file_tx, file_rx) = sync_channel::<ProjectFileLoadResult>(2);
     // bounded save result channel (off event loop thread atomic write + fsync+rename, epoch/rev tagged)
     let (save_tx, save_rx) = sync_channel::<SaveResult>(2);
+    // Exactly one terminal launch runs at a time. Its tagged result is delivered
+    // reliably; a superseding request is dispatched only after the stale result drains.
+    let (terminal_tx, terminal_rx) = sync_channel::<TerminalStartResult>(1);
+    let (ssh_activation_tx, ssh_activation_rx) =
+        sync_channel::<SshActivationResult>(configured_ssh.len().max(1));
+    let mut ssh_activation_in_flight = std::collections::HashMap::new();
+    let mut startup_passphrase_prompted = false;
+    for (label, runtime) in &configured_ssh {
+        if crate::authority::Authority::trust(runtime.authority.as_ref())
+            == crate::authority::types::AuthorityTrust::ExecutionGranted
+        {
+            if runtime.passphrase_required {
+                app.set_authority_connection(
+                    label,
+                    crate::app::AuthorityConnectionState::Disconnected,
+                    format!("SSH authority {label} requires its key passphrase."),
+                );
+                if !startup_passphrase_prompted
+                    && app.current_ssh_authority_label().as_deref() == Some(label.as_str())
+                {
+                    app.prompt_ssh_passphrase(label.clone());
+                    startup_passphrase_prompted = true;
+                }
+            } else {
+                app.set_authority_connection(
+                    label,
+                    crate::app::AuthorityConnectionState::Connecting,
+                    format!("Connecting SSH authority {label}…"),
+                );
+                let task = dispatch_ssh_activation(
+                    label.clone(),
+                    app.epoch,
+                    runtime.clone(),
+                    None,
+                    ssh_activation_tx.clone(),
+                );
+                ssh_activation_in_flight.insert(label.clone(), task);
+            }
+        }
+    }
 
     // bounded syntax result channel; coalesced single in-flight for current doc (no per-rev fanout)
     let (syntax_tx, syntax_rx) = sync_channel::<SyntaxResult>(4);
     let mut syntax_coalesce = SyntaxCoalesceState::default();
     let mut file_coalesce = ProjectFileCoalesceState::default();
     let mut save_coalesce = SaveCoalesceState::default();
+    let mut terminal_launch_in_flight = false;
     // initial draw (borrow guard only)
     {
         let snap = app.snapshot();
@@ -380,6 +693,43 @@ pub fn run_event_loop(
                 spawn_save(next_req, save_tx.clone());
             }
         }
+        while let Ok(started) = terminal_rx.try_recv() {
+            terminal_launch_in_flight = false;
+            match started.result {
+                Ok(session) => app.attach_terminal(
+                    started.epoch,
+                    started.launch_id,
+                    started.authority_label,
+                    session,
+                ),
+                Err(message) => app.fail_terminal_start(started.epoch, started.launch_id, message),
+            }
+        }
+        if !terminal_launch_in_flight {
+            if let Some(spec) = app.terminal_spawn_spec() {
+                dispatch_terminal_start(spec, terminal_tx.clone());
+                terminal_launch_in_flight = true;
+            }
+        }
+        while let Ok(activated) = ssh_activation_rx.try_recv() {
+            ssh_activation_in_flight.remove(&activated.label);
+            if activated.epoch != app.epoch {
+                continue;
+            }
+            match activated.result {
+                Ok(()) => app.set_authority_connection(
+                    &activated.label,
+                    crate::app::AuthorityConnectionState::Connected,
+                    format!("SSH authority {} connected.", activated.label),
+                ),
+                Err(error) => app.set_authority_connection(
+                    &activated.label,
+                    crate::app::AuthorityConnectionState::Disconnected,
+                    format!("SSH authority {} failed: {error}", activated.label),
+                ),
+            }
+        }
+        app.refresh_authority_connections();
         // input
         match input_rx.try_recv() {
             Ok(ct_ev) => {
@@ -453,7 +803,94 @@ pub fn run_event_loop(
                             spawn_project_file_read(p, ep, file_tx.clone());
                         }
                     }
+                    if matches!(&act, Action::OpenTerminal) {
+                        app.apply_action(act);
+                        if !terminal_launch_in_flight {
+                            if let Some(spec) = app.terminal_spawn_spec() {
+                                dispatch_terminal_start(spec, terminal_tx.clone());
+                                terminal_launch_in_flight = true;
+                            }
+                        }
+                        continue;
+                    }
+                    let should_activate_ssh =
+                        matches!(&act, Action::GrantTrust | Action::CycleAuthority);
+                    let should_disconnect_ssh = matches!(&act, Action::RevokeTrust);
+                    let submitted_ssh_passphrase = matches!(&act, Action::SshPassphraseSubmit);
+                    let affected_ssh_label = app.current_ssh_authority_label();
                     app.apply_action(act);
+                    if submitted_ssh_passphrase {
+                        if let Some((label, passphrase)) = app.take_submitted_ssh_passphrase() {
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                ssh_activation_in_flight.entry(label.clone())
+                            {
+                                if let Some(runtime) = configured_ssh.get(&label) {
+                                    app.set_authority_connection(
+                                        &label,
+                                        crate::app::AuthorityConnectionState::Connecting,
+                                        format!("Connecting SSH authority {label}…"),
+                                    );
+                                    let task = dispatch_ssh_activation(
+                                        label,
+                                        app.epoch,
+                                        runtime.clone(),
+                                        Some(passphrase),
+                                        ssh_activation_tx.clone(),
+                                    );
+                                    entry.insert(task);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if should_disconnect_ssh {
+                        if let Some(label) = affected_ssh_label {
+                            if let Some(task) = ssh_activation_in_flight.remove(&label) {
+                                task.abort();
+                            }
+                            if let Some(runtime) = configured_ssh.get(&label) {
+                                let authority = Arc::clone(&runtime.authority);
+                                tokio::spawn(async move {
+                                    authority.disconnect().await;
+                                });
+                            }
+                            app.set_authority_connection(
+                                &label,
+                                crate::app::AuthorityConnectionState::Disconnected,
+                                format!("SSH authority {label} disconnected."),
+                            );
+                        }
+                    }
+                    if should_activate_ssh && app.current_trust() == crate::app::TrustLevel::Trusted
+                    {
+                        if let Some(label) = app.current_ssh_authority_label() {
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                ssh_activation_in_flight.entry(label.clone())
+                            {
+                                if let Some(runtime) = configured_ssh.get(&label) {
+                                    if !runtime.authority.is_connected() {
+                                        if runtime.passphrase_required {
+                                            app.prompt_ssh_passphrase(label);
+                                        } else {
+                                            app.set_authority_connection(
+                                                &label,
+                                                crate::app::AuthorityConnectionState::Connecting,
+                                                format!("Connecting SSH authority {label}…"),
+                                            );
+                                            let task = dispatch_ssh_activation(
+                                                label,
+                                                app.epoch,
+                                                runtime.clone(),
+                                                None,
+                                                ssh_activation_tx.clone(),
+                                            );
+                                            entry.insert(task);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -853,6 +1290,18 @@ mod state_runtime_fix_tests {
     use super::*;
     use crate::layout::Landmark;
     use crate::persistence::journal::start_journal_worker;
+
+    #[test]
+    fn remote_helper_target_allowlist_is_closed() {
+        assert!(is_qualified_remote_helper_target(
+            "hermito-remote-x86_64-unknown-linux-musl"
+        ));
+        assert!(is_qualified_remote_helper_target(
+            "hermito-remote-aarch64-unknown-linux-musl"
+        ));
+        assert!(!is_qualified_remote_helper_target("hermito-remote"));
+        assert!(!is_qualified_remote_helper_target(""));
+    }
 
     #[test]
     fn compaction_retry_on_tick_path_retains_until_success() {

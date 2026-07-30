@@ -1,0 +1,21 @@
+[package]
+name = "hermito-remote"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hermito-remote"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+hermito-protocol = { path = "../hermito-protocol" }
+portable-pty.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

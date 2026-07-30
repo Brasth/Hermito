@@ -2,6 +2,7 @@ pub mod authority_path;
 pub mod editor;
 pub mod project_tree;
 pub mod status_bar;
+pub mod terminal_pane;
 pub mod theme;
 pub mod tool_stripe;
 pub mod tool_window;

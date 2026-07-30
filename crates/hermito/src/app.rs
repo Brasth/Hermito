@@ -3,7 +3,9 @@ use crate::buffer::{Buffer, CheckpointPayload};
 use crate::document::{BufferPathState, DocumentId, DocumentRevision, Language, WorkspaceEpoch};
 use crate::layout::{EditorTabState, Landmark, WorkbenchLayout};
 use crate::persistence::journal::{JournalAck, JournalHandle, RecoveredBuffer, Recovery};
+use std::sync::{Arc, RwLock};
 use tree_sitter::Tree;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrustLevel {
@@ -18,11 +20,21 @@ pub enum AuthorityKind {
     DevContainer,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum AuthorityConnectionState {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    Lost,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthorityState {
     pub kind: AuthorityKind,
     pub label: String,
     pub trust: TrustLevel,
+    pub connection: AuthorityConnectionState,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +73,11 @@ pub enum OverlaySnapshot {
         path: String,
         invoker: Landmark,
     },
+    SshPassphrase {
+        authority_label: String,
+        length: usize,
+        invoker: Landmark,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,6 +99,41 @@ pub struct StatusSnapshot {
     pub column: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalViewState {
+    #[default]
+    None,
+    Starting,
+    Running,
+    Exited,
+    Lost,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TerminalSnapshot {
+    pub state: TerminalViewState,
+    pub surface: Option<Arc<RwLock<crate::terminal::TerminalSurface>>>,
+    pub captured: bool,
+    pub authority_label: String,
+}
+
+pub(crate) enum TerminalSpawnSpec {
+    Local {
+        root: std::path::PathBuf,
+        epoch: WorkspaceEpoch,
+        launch_id: u64,
+        rows: u16,
+        cols: u16,
+    },
+    Remote {
+        epoch: WorkspaceEpoch,
+        launch_id: u64,
+        authority_label: String,
+        authority: Arc<crate::authority::ssh::SshAuthority>,
+        request: crate::authority::types::AuthorityRequest<crate::authority::types::PtyRequest>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct AppSnapshot {
     pub epoch: WorkspaceEpoch,
@@ -96,6 +148,7 @@ pub struct AppSnapshot {
     pub active_editor_tab: usize,
     pub project: ProjectTreeSnapshot,
     pub status: StatusSnapshot,
+    pub terminal: TerminalSnapshot,
     pub journal_lagging: bool,
     pub workspace_root: String,
     pub workspace_name: String,
@@ -126,6 +179,12 @@ pub struct App {
     status_message: String,
     workspace_root: String,
     workspace_name: String,
+    terminal: Option<crate::pty::PtySession>,
+    ssh_authorities: std::collections::HashMap<String, Arc<crate::authority::ssh::SshAuthority>>,
+    terminal_starting: bool,
+    terminal_launch_id: u64,
+    terminal_capture: bool,
+    submitted_ssh_passphrase: Option<(String, Zeroizing<Vec<u8>>)>,
 }
 pub(crate) enum Overlay {
     None,
@@ -145,6 +204,11 @@ pub(crate) enum Overlay {
         path: String,
         invoker: Landmark,
         doc_id: DocumentId,
+    },
+    SshPassphrase {
+        authority_label: String,
+        passphrase: Zeroizing<String>,
+        invoker: Landmark,
     },
 }
 
@@ -205,6 +269,7 @@ impl App {
                 kind: AuthorityKind::Local,
                 label: "host".into(),
                 trust: TrustLevel::InspectOnly,
+                connection: AuthorityConnectionState::Connected,
             }],
             current_authority: 0,
             focus: Landmark::Editor,
@@ -223,6 +288,12 @@ impl App {
             status_message: String::new(),
             workspace_root: "/workspace".into(),
             workspace_name: "workspace".into(),
+            terminal: None,
+            ssh_authorities: std::collections::HashMap::new(),
+            terminal_starting: false,
+            terminal_launch_id: 0,
+            terminal_capture: false,
+            submitted_ssh_passphrase: None,
         }
     }
 
@@ -237,6 +308,40 @@ impl App {
             }
             Action::FocusLandmark(l) => {
                 self.focus = l;
+                self.terminal_capture = l == Landmark::BottomPane
+                    && self.layout.bottom_active_tab == 0
+                    && self.terminal.as_ref().is_some_and(|session| {
+                        session.state() == crate::pty::PtySessionState::Running
+                    });
+            }
+            Action::CycleAuthority => {
+                if self.authorities.len() < 2 {
+                    self.status_message = "No configured SSH authority.".into();
+                } else {
+                    self.current_authority = (self.current_authority + 1) % self.authorities.len();
+                    self.terminal_starting = false;
+                    self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+                    self.terminal_capture = false;
+                    if let Some(session) = self.terminal.take() {
+                        session.cancel();
+                        std::thread::spawn(move || {
+                            let _ = session.join_reader();
+                        });
+                    }
+                    if let Some(authority) = self.authorities.get(self.current_authority) {
+                        self.status_message = format!(
+                            "{} authority selected ({}).",
+                            authority.label,
+                            match authority.connection {
+                                AuthorityConnectionState::Disconnected => "disconnected",
+                                AuthorityConnectionState::Connecting => "connecting",
+                                AuthorityConnectionState::Connected => "connected",
+                                AuthorityConnectionState::Lost => "lost",
+                            }
+                        );
+                    }
+                    self.focus = Landmark::Authority;
+                }
             }
             Action::NextControl => {
                 if let Overlay::TrustReview { focused_grant, .. } = &mut self.overlay {
@@ -347,8 +452,100 @@ impl App {
                     self.project.scroll = ((self.project.scroll as i32) + lines).max(0) as u16;
                 }
             }
+            Action::OpenTerminal => {
+                self.layout.bottom_visible = true;
+                self.layout.bottom_active_tab = 0;
+                self.focus = Landmark::BottomPane;
+                if self.current_trust() != TrustLevel::Trusted {
+                    self.terminal_starting = false;
+                    self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+                    self.terminal_capture = false;
+                    self.status_message =
+                        "Terminal blocked: current authority is INSPECT ONLY.".into();
+                } else if self
+                    .authorities
+                    .get(self.current_authority)
+                    .is_some_and(|authority| authority.kind == AuthorityKind::Ssh)
+                    && self
+                        .current_ssh_authority()
+                        .is_none_or(|authority| !authority.is_connected())
+                {
+                    self.terminal_starting = false;
+                    self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+                    self.terminal_capture = false;
+                    self.status_message =
+                        "SSH helper is not connected. Activate this authority before opening a terminal."
+                            .into();
+                } else if self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|session| session.state() == crate::pty::PtySessionState::Running)
+                {
+                    self.terminal_capture = true;
+                } else {
+                    if let Some(session) = self.terminal.take() {
+                        session.cancel();
+                        std::thread::spawn(move || {
+                            let _ = session.join_reader();
+                        });
+                    }
+                    self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+                    self.terminal_starting = true;
+                    self.terminal_capture = false;
+                    let kind = self
+                        .authorities
+                        .get(self.current_authority)
+                        .map(|authority| authority.kind)
+                        .unwrap_or(AuthorityKind::Local);
+                    self.status_message = format!(
+                        "Starting {} terminal…",
+                        crate::ui::authority_kind_label(kind)
+                    );
+                }
+            }
+            Action::TerminalInput(bytes) => {
+                if self.terminal_capture {
+                    let input_error = self
+                        .terminal
+                        .as_ref()
+                        .and_then(|session| session.write_input(&bytes).err());
+                    if let Some(error) = input_error {
+                        if let Some(session) = self.terminal.take() {
+                            session.cancel();
+                            std::thread::spawn(move || {
+                                let _ = session.join_reader();
+                            });
+                        }
+                        self.status_message = error.to_string();
+                        self.terminal_capture = false;
+                    }
+                }
+            }
+            Action::ReleaseTerminalCapture => {
+                self.terminal_capture = false;
+                self.focus = Landmark::Editor;
+                self.status_message = "Terminal capture released.".into();
+            }
+            Action::CloseTerminal => {
+                self.terminal_starting = false;
+                self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+                self.terminal_capture = false;
+                if let Some(session) = self.terminal.take() {
+                    session.cancel();
+                    std::thread::spawn(move || {
+                        let _ = session.join_reader();
+                    });
+                }
+            }
             Action::TerminalResize { width, height } => {
                 self.layout.resize(width, height);
+                let body = self.layout.rect_bottom();
+                if let Some(session) = &self.terminal {
+                    let _ = session.resize(
+                        body.height.saturating_sub(2).max(1),
+                        body.width.saturating_sub(2).max(1),
+                    );
+                }
             }
             Action::ReviewTrust => {
                 let label = self
@@ -378,6 +575,9 @@ impl App {
                     if let Some(authority) = self.authorities.get_mut(self.current_authority) {
                         authority.trust = TrustLevel::Trusted;
                     }
+                    if let Some(authority) = self.current_ssh_authority() {
+                        crate::authority::Authority::grant_execution(authority.as_ref());
+                    }
                     self.focus = invoker;
                     self.overlay = Overlay::None;
                     self.status_message = "Execution granted for current authority.".into();
@@ -387,11 +587,24 @@ impl App {
                 let invoker = match &self.overlay {
                     Overlay::TrustReview { invoker, .. }
                     | Overlay::CommandPalette { invoker, .. }
-                    | Overlay::SaveAs { invoker, .. } => Some(*invoker),
+                    | Overlay::SaveAs { invoker, .. }
+                    | Overlay::SshPassphrase { invoker, .. } => Some(*invoker),
                     Overlay::None => None,
                 };
                 if let Some(authority) = self.authorities.get_mut(self.current_authority) {
                     authority.trust = TrustLevel::InspectOnly;
+                }
+                if let Some(authority) = self.current_ssh_authority() {
+                    crate::authority::Authority::revoke_execution(authority.as_ref());
+                }
+                self.terminal_capture = false;
+                self.terminal_starting = false;
+                self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+                if let Some(session) = self.terminal.take() {
+                    session.cancel();
+                    std::thread::spawn(move || {
+                        let _ = session.join_reader();
+                    });
                 }
                 if let Some(invoker) = invoker {
                     self.focus = invoker;
@@ -400,14 +613,44 @@ impl App {
                 self.status_message = "Execution revoked. Now INSPECT ONLY.".into();
             }
             Action::CancelModal => {
-                if let Overlay::TrustReview { invoker, .. } = &self.overlay {
-                    self.focus = *invoker;
-                } else if let Overlay::CommandPalette { invoker, .. } = &self.overlay {
-                    self.focus = *invoker;
-                } else if let Overlay::SaveAs { invoker, .. } = &self.overlay {
+                if let Overlay::TrustReview { invoker, .. }
+                | Overlay::CommandPalette { invoker, .. }
+                | Overlay::SaveAs { invoker, .. }
+                | Overlay::SshPassphrase { invoker, .. } = &self.overlay
+                {
                     self.focus = *invoker;
                 }
                 self.overlay = Overlay::None;
+            }
+            Action::SshPassphraseInput(character) => {
+                if !character.is_control() {
+                    if let Overlay::SshPassphrase { passphrase, .. } = &mut self.overlay {
+                        if passphrase.len() + character.len_utf8() <= 4096 {
+                            passphrase.push(character);
+                        }
+                    }
+                }
+            }
+            Action::SshPassphraseBackspace => {
+                if let Overlay::SshPassphrase { passphrase, .. } = &mut self.overlay {
+                    passphrase.pop();
+                }
+            }
+            Action::SshPassphraseSubmit => {
+                let overlay = std::mem::replace(&mut self.overlay, Overlay::None);
+                if let Overlay::SshPassphrase {
+                    authority_label,
+                    passphrase,
+                    invoker,
+                } = overlay
+                {
+                    self.submitted_ssh_passphrase = Some((
+                        authority_label,
+                        Zeroizing::new(passphrase.as_bytes().to_vec()),
+                    ));
+                    self.focus = invoker;
+                    self.status_message = "SSH passphrase submitted.".into();
+                }
             }
             Action::JournalAck {
                 doc_id,
@@ -1000,6 +1243,45 @@ impl App {
                 path: path.clone(),
                 invoker: *invoker,
             },
+            Overlay::SshPassphrase {
+                authority_label,
+                passphrase,
+                invoker,
+            } => OverlaySnapshot::SshPassphrase {
+                authority_label: authority_label.clone(),
+                length: passphrase.chars().count(),
+                invoker: *invoker,
+            },
+        };
+        let authority_label = self
+            .authorities
+            .get(self.current_authority)
+            .map(|authority| authority.label.clone())
+            .unwrap_or_default();
+        let terminal = if self.terminal_starting {
+            TerminalSnapshot {
+                state: TerminalViewState::Starting,
+                surface: None,
+                captured: false,
+                authority_label,
+            }
+        } else if let Some(session) = &self.terminal {
+            let state = match session.state() {
+                crate::pty::PtySessionState::Running => TerminalViewState::Running,
+                crate::pty::PtySessionState::Exited => TerminalViewState::Exited,
+                crate::pty::PtySessionState::Lost => TerminalViewState::Lost,
+            };
+            TerminalSnapshot {
+                state,
+                surface: Some(session.surface_handle()),
+                captured: self.terminal_capture && state == TerminalViewState::Running,
+                authority_label,
+            }
+        } else {
+            TerminalSnapshot {
+                authority_label,
+                ..TerminalSnapshot::default()
+            }
         };
         AppSnapshot {
             epoch: self.epoch,
@@ -1026,6 +1308,7 @@ impl App {
                 line: 1,
                 column: 1,
             },
+            terminal,
             journal_lagging: !self.pending_checkpoints.is_empty()
                 || !self.pending_compactions.is_empty(),
             workspace_root: self.workspace_root.clone(),
@@ -1160,10 +1443,20 @@ impl App {
             } else {
                 TrustLevel::InspectOnly
             };
+            let kind = match tr.kind.as_str() {
+                "ssh" => AuthorityKind::Ssh,
+                "dev_container" => AuthorityKind::DevContainer,
+                _ => AuthorityKind::Local,
+            };
             authorities.push(AuthorityState {
-                kind: AuthorityKind::Local,
+                kind,
                 label: tr.authority.clone(),
                 trust: level,
+                connection: if kind == AuthorityKind::Local {
+                    AuthorityConnectionState::Connected
+                } else {
+                    AuthorityConnectionState::Disconnected
+                },
             });
         }
         if authorities.is_empty() {
@@ -1171,6 +1464,7 @@ impl App {
                 kind: AuthorityKind::Local,
                 label: "host".into(),
                 trust: TrustLevel::InspectOnly,
+                connection: AuthorityConnectionState::Connected,
             });
         }
         let workspace_root = state
@@ -1213,6 +1507,12 @@ impl App {
             status_message: String::new(),
             workspace_root,
             workspace_name: "workspace".into(),
+            terminal: None,
+            ssh_authorities: std::collections::HashMap::new(),
+            terminal_starting: false,
+            terminal_launch_id: 0,
+            terminal_capture: false,
+            submitted_ssh_passphrase: None,
         }
     }
 
@@ -1225,6 +1525,11 @@ impl App {
             .map(|a| crate::persistence::state::TrustRecord {
                 workspace_root: PathBuf::from(&self.workspace_root),
                 authority: a.label.clone(),
+                kind: match a.kind {
+                    AuthorityKind::Local => "local".into(),
+                    AuthorityKind::Ssh => "ssh".into(),
+                    AuthorityKind::DevContainer => "dev_container".into(),
+                },
                 level: match a.trust {
                     TrustLevel::Trusted => "trusted".into(),
                     TrustLevel::InspectOnly => "inspect_only".into(),
@@ -1274,6 +1579,253 @@ impl App {
     pub fn workspace_root(&self) -> &str {
         &self.workspace_root
     }
+    pub fn register_ssh_authority(&mut self, authority: Arc<crate::authority::ssh::SshAuthority>) {
+        let label = crate::authority::Authority::label(authority.as_ref()).to_owned();
+        let state = self
+            .authorities
+            .iter_mut()
+            .find(|state| state.kind == AuthorityKind::Ssh && state.label == label);
+        let trusted = state
+            .as_ref()
+            .is_some_and(|state| state.trust == TrustLevel::Trusted);
+        if trusted {
+            crate::authority::Authority::grant_execution(authority.as_ref());
+        } else {
+            crate::authority::Authority::revoke_execution(authority.as_ref());
+        }
+        if let Some(state) = state {
+            state.connection = if authority.is_connected() {
+                AuthorityConnectionState::Connected
+            } else {
+                AuthorityConnectionState::Disconnected
+            };
+        } else {
+            self.authorities.push(AuthorityState {
+                kind: AuthorityKind::Ssh,
+                label: label.clone(),
+                trust: TrustLevel::InspectOnly,
+                connection: if authority.is_connected() {
+                    AuthorityConnectionState::Connected
+                } else {
+                    AuthorityConnectionState::Disconnected
+                },
+            });
+        }
+        self.ssh_authorities.insert(label, authority);
+    }
+
+    pub fn select_ssh_authority(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        if let Some(index) = self
+            .authorities
+            .iter()
+            .position(|authority| authority.kind == AuthorityKind::Ssh && authority.label == label)
+        {
+            self.current_authority = index;
+        } else {
+            self.authorities.push(AuthorityState {
+                kind: AuthorityKind::Ssh,
+                label,
+                trust: TrustLevel::InspectOnly,
+                connection: AuthorityConnectionState::Disconnected,
+            });
+            self.current_authority = self.authorities.len() - 1;
+        }
+        self.terminal_capture = false;
+        self.terminal_starting = false;
+        self.terminal_launch_id = self.terminal_launch_id.wrapping_add(1);
+        if let Some(session) = self.terminal.take() {
+            session.cancel();
+            std::thread::spawn(move || {
+                let _ = session.join_reader();
+            });
+        }
+        self.status_message =
+            "SSH authority selected in INSPECT ONLY mode. Accept its host key before granting execution."
+                .into();
+        self.focus = Landmark::Authority;
+    }
+
+    pub(crate) fn current_ssh_authority_label(&self) -> Option<String> {
+        self.authorities
+            .get(self.current_authority)
+            .filter(|authority| authority.kind == AuthorityKind::Ssh)
+            .map(|authority| authority.label.clone())
+    }
+
+    pub(crate) fn prompt_ssh_passphrase(&mut self, authority_label: String) {
+        let invoker = self.focus;
+        self.overlay = Overlay::SshPassphrase {
+            authority_label,
+            passphrase: Zeroizing::new(String::new()),
+            invoker,
+        };
+        self.focus = Landmark::Authority;
+        self.status_message = "Enter the selected SSH key passphrase.".into();
+    }
+
+    pub(crate) fn take_submitted_ssh_passphrase(&mut self) -> Option<(String, Zeroizing<Vec<u8>>)> {
+        self.submitted_ssh_passphrase.take()
+    }
+
+    pub(crate) fn set_authority_connection(
+        &mut self,
+        label: &str,
+        connection: AuthorityConnectionState,
+        message: String,
+    ) {
+        if let Some(authority) = self
+            .authorities
+            .iter_mut()
+            .find(|authority| authority.kind == AuthorityKind::Ssh && authority.label == label)
+        {
+            authority.connection = connection;
+        }
+        self.status_message = message;
+    }
+
+    pub fn set_current_authority_connection(&mut self, connection: AuthorityConnectionState) {
+        if let Some(authority) = self.authorities.get_mut(self.current_authority) {
+            authority.connection = connection;
+        }
+        self.status_message = match connection {
+            AuthorityConnectionState::Disconnected => "Authority disconnected.".into(),
+            AuthorityConnectionState::Connecting => "Authority bootstrap in progress…".into(),
+            AuthorityConnectionState::Connected => "Authority connected.".into(),
+            AuthorityConnectionState::Lost => {
+                "Authority transport Lost – request a new terminal session.".into()
+            }
+        };
+    }
+    pub fn refresh_authority_connections(&mut self) {
+        for state in &mut self.authorities {
+            if state.kind != AuthorityKind::Ssh {
+                continue;
+            }
+            let connected = self
+                .ssh_authorities
+                .get(&state.label)
+                .is_some_and(|authority| authority.is_connected());
+            if connected {
+                state.connection = AuthorityConnectionState::Connected;
+            } else if state.connection == AuthorityConnectionState::Connected {
+                state.connection = AuthorityConnectionState::Lost;
+            }
+        }
+    }
+
+    pub fn terminal_start_in_flight(&self) -> bool {
+        self.terminal_starting
+    }
+
+    pub(crate) fn terminal_spawn_spec(&self) -> Option<TerminalSpawnSpec> {
+        if !self.terminal_starting
+            || self.terminal.is_some()
+            || self.current_trust() != TrustLevel::Trusted
+        {
+            return None;
+        }
+        let area = self.layout.rect_bottom();
+        let rows = area.height.saturating_sub(2).max(1);
+        let cols = area.width.saturating_sub(2).max(1);
+        let current = self.authorities.get(self.current_authority)?;
+        match current.kind {
+            AuthorityKind::Local => Some(TerminalSpawnSpec::Local {
+                root: std::path::PathBuf::from(&self.workspace_root),
+                epoch: self.epoch,
+                launch_id: self.terminal_launch_id,
+                rows,
+                cols,
+            }),
+            AuthorityKind::Ssh => {
+                let authority = self.ssh_authorities.get(&current.label)?.clone();
+                if !authority.is_connected() {
+                    return None;
+                }
+                let remote_root = crate::authority::Authority::root(authority.as_ref())
+                    .to_string_lossy()
+                    .into_owned();
+                let command = hermito_protocol::request::CommandSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["-l".into()],
+                    cwd: remote_root,
+                    env: crate::authority::types::allowlisted_environment([
+                        ("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into()),
+                        ("TERM".into(), "xterm-256color".into()),
+                    ]),
+                };
+                let request = crate::authority::types::AuthorityRequest::new(
+                    crate::authority::types::PtyRequest {
+                        command,
+                        size: portable_pty::PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        },
+                    },
+                    hermito_protocol::WorkspaceEpoch(self.epoch.0),
+                    crate::authority::Authority::environment_epoch(authority.as_ref()),
+                    None,
+                );
+                Some(TerminalSpawnSpec::Remote {
+                    epoch: self.epoch,
+                    launch_id: self.terminal_launch_id,
+                    authority_label: current.label.clone(),
+                    authority,
+                    request,
+                })
+            }
+            AuthorityKind::DevContainer => None,
+        }
+    }
+
+    pub fn attach_terminal(
+        &mut self,
+        epoch: WorkspaceEpoch,
+        launch_id: u64,
+        authority_label: String,
+        session: crate::pty::PtySession,
+    ) {
+        if epoch != self.epoch
+            || launch_id != self.terminal_launch_id
+            || !self.terminal_starting
+            || session.workspace_epoch().0 != epoch.0
+        {
+            session.cancel();
+            std::thread::spawn(move || {
+                let _ = session.join_reader();
+            });
+            return;
+        }
+        let area = self.layout.rect_bottom();
+        if let Err(error) = session.resize(
+            area.height.saturating_sub(2).max(1),
+            area.width.saturating_sub(2).max(1),
+        ) {
+            session.cancel();
+            std::thread::spawn(move || {
+                let _ = session.join_reader();
+            });
+            self.terminal_starting = false;
+            self.terminal_capture = false;
+            self.status_message = format!("Terminal resize failed during startup: {error}");
+            return;
+        }
+        self.terminal = Some(session);
+        self.terminal_starting = false;
+        self.terminal_capture = true;
+        self.focus = Landmark::BottomPane;
+        self.status_message = format!("{authority_label} terminal running. Esc releases capture.");
+    }
+
+    pub fn fail_terminal_start(&mut self, epoch: WorkspaceEpoch, launch_id: u64, message: String) {
+        if epoch == self.epoch && launch_id == self.terminal_launch_id && self.terminal_starting {
+            self.terminal_starting = false;
+            self.terminal_capture = false;
+            self.status_message = format!("Terminal failed: {message}");
+        }
+    }
 
     pub fn syntax_is_current(&self, doc_id: DocumentId, revision: DocumentRevision) -> bool {
         self.syntax_highlights
@@ -1301,6 +1853,14 @@ impl App {
                     .insert(sres.doc_id, (sres.revision, sres.tree, sres.source));
             }
         }
+    }
+
+    fn current_ssh_authority(&self) -> Option<Arc<crate::authority::ssh::SshAuthority>> {
+        let current = self.authorities.get(self.current_authority)?;
+        if current.kind != AuthorityKind::Ssh {
+            return None;
+        }
+        self.ssh_authorities.get(&current.label).cloned()
     }
 
     pub fn current_trust(&self) -> TrustLevel {

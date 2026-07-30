@@ -33,7 +33,7 @@ Implement the approved Hermito product contract as seven release-gated vertical 
 | Phase | Name | Status |
 |-------|------|--------|
 | 1 | [Core Workbench and Editor](./phase-01-core-workbench-and-editor.md) | Completed |
-| 2 | [Terminal and Execution Transport](./phase-02-terminal-and-execution-transport.md) | Pending |
+| 2 | [Terminal and Execution Transport](./phase-02-terminal-and-execution-transport.md) | Completed |
 | 3 | [Language Intelligence](./phase-03-language-intelligence.md) | Pending |
 | 4 | [Advanced Local Git](./phase-04-advanced-local-git.md) | Pending |
 | 5 | [Dev Container Orchestration](./phase-05-dev-container-orchestration.md) | Pending |

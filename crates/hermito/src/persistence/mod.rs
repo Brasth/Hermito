@@ -48,12 +48,12 @@ pub fn set_owner_only(path: &std::path::Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
         std::fs::set_permissions(path, perms)?;
+        Ok(())
     }
     #[cfg(windows)]
     {
-        return set_windows_owner_only_acl(path, 0);
+        set_windows_owner_only_acl(path, 0)
     }
-    Ok(())
 }
 
 /// Set owner-only permissions appropriate for a *directory*: 0o700 on Unix (rwx for owner only,
@@ -66,14 +66,14 @@ pub fn set_owner_only_dir(path: &std::path::Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(path, perms)?;
+        Ok(())
     }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
         const INHERIT: u32 = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-        return set_windows_owner_only_acl(path, INHERIT);
+        set_windows_owner_only_acl(path, INHERIT)
     }
-    Ok(())
 }
 /// Create the directory (parents too) and immediately harden it with owner-only directory
 /// permissions. Fail closed. For use on hermito config/state/journal directories only.
@@ -95,14 +95,13 @@ fn set_windows_owner_only_acl(path: &std::path::Path, inherit_flags: u32) -> std
     use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         AddAccessAllowedAceEx, GetLengthSid, GetTokenInformation, InitializeAcl, IsValidSid,
-        TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-        TOKEN_QUERY, TOKEN_USER,
+        TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    let mut token: HANDLE = 0;
-    if unsafe { OpenProcessToken(unsafe { GetCurrentProcess() }, TOKEN_QUERY, &mut token) } == 0 {
+    let mut token: HANDLE = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::from_raw_os_error(
             unsafe { GetLastError() } as i32
         ));
@@ -330,7 +329,7 @@ fn copy_windows_acl(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
-    use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_SUCCESS, HLOCAL};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
     };

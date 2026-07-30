@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppSnapshot, TrustLevel},
+    app::{AppSnapshot, AuthorityConnectionState, TrustLevel},
     layout::Landmark,
 };
 
@@ -40,9 +40,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &AppSnapshot) {
         };
         route.push(Span::styled(
             format!(
-                "{} · {}",
+                "{} · {}{}",
                 authority_kind_label(authority.kind),
-                authority.label
+                authority.label,
+                connection_suffix(authority.connection),
             ),
             style,
         ));
@@ -50,6 +51,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &AppSnapshot) {
 
     let current = snapshot.authorities.get(snapshot.current_authority_idx);
     let detail = match current {
+        Some(authority) if authority.connection == AuthorityConnectionState::Lost => {
+            Line::from(vec![
+                Span::styled(" [x] CURRENT ", theme::danger()),
+                Span::styled(
+                    format!(
+                        "{} · {}",
+                        authority_kind_label(authority.kind),
+                        authority.label
+                    ),
+                    theme::current_authority(),
+                ),
+                Span::styled(
+                    "  |  LOST · new session required; no PTY resume",
+                    theme::danger(),
+                ),
+                Span::styled("  [Enter] Review trust", theme::header()),
+            ])
+        }
         Some(authority) if authority.trust == TrustLevel::Trusted => Line::from(vec![
             Span::styled(" [+] CURRENT ", theme::current_authority()),
             Span::styled(
@@ -98,4 +117,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, snapshot: &AppSnapshot) {
         theme::header()
     };
     frame.render_widget(Paragraph::new(lines).style(style), area);
+}
+
+fn connection_suffix(connection: AuthorityConnectionState) -> &'static str {
+    match connection {
+        AuthorityConnectionState::Disconnected => " [DISCONNECTED]",
+        AuthorityConnectionState::Connecting => " [CONNECTING]",
+        AuthorityConnectionState::Connected => "",
+        AuthorityConnectionState::Lost => " [LOST]",
+    }
 }

@@ -16,7 +16,7 @@ use crate::{
 use super::{
     authority_path,
     editor::{self, EditorDocument},
-    project_tree, status_bar, theme,
+    project_tree, status_bar, terminal_pane, theme,
     tool_stripe::{self, StripeSide},
     tool_window, toolbar,
 };
@@ -89,6 +89,11 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &AppSnapshot) {
             ..
         } => render_command_palette_overlay(frame, query, items, *selected),
         OverlaySnapshot::SaveAs { path, .. } => render_save_as_overlay(frame, path),
+        OverlaySnapshot::SshPassphrase {
+            authority_label,
+            length,
+            ..
+        } => render_ssh_passphrase_overlay(frame, authority_label, *length),
     }
 }
 
@@ -218,6 +223,17 @@ fn render_bottom_body(frame: &mut Frame<'_>, area: Rect, snapshot: &AppSnapshot)
         return;
     }
     let trusted = snapshot.current_trust == TrustLevel::Trusted;
+    if snapshot.layout.bottom_active_tab == 0
+        && (trusted || snapshot.terminal.state != crate::app::TerminalViewState::None)
+    {
+        terminal_pane::render(
+            frame,
+            area,
+            &snapshot.terminal,
+            snapshot.focus == Landmark::BottomPane,
+        );
+        return;
+    }
     let (text, style) = match snapshot.layout.bottom_active_tab {
         1 if snapshot.status.problems == 0 => (
             Cow::Borrowed("No problems. Diagnostics will appear here with a file, location, and next action."),
@@ -246,7 +262,7 @@ fn render_bottom_body(frame: &mut Frame<'_>, area: Rect, snapshot: &AppSnapshot)
         ),
     };
     frame.render_widget(
-        Paragraph::new(text.as_ref()).style(style).block(
+        Paragraph::new(text.as_ref() as &str).style(style).block(
             Block::new()
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(if snapshot.focus == Landmark::BottomPane {
@@ -418,4 +434,28 @@ pub fn render_save_as_overlay(frame: &mut Frame<'_>, path: &str) {
         .style(theme::surface())
         .wrap(Wrap { trim: true });
     frame.render_widget(p, area);
+}
+
+pub fn render_ssh_passphrase_overlay(frame: &mut Frame<'_>, authority_label: &str, length: usize) {
+    let area = centered(frame.area(), 60, 7);
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Encrypted SSH key",
+            theme::header().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("Authority  {authority_label}")),
+        Line::from(format!("Passphrase > {}", "•".repeat(length))),
+        Line::from(""),
+        Line::from("Enter: connect  •  Esc: cancel  •  Backspace"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(theme::surface()).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(theme::FOCUS))
+                .style(theme::surface()),
+        ),
+        area,
+    );
 }
