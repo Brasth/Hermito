@@ -10,6 +10,7 @@ use std::{
 use hermito_protocol::{
     frame::{AggregateBudget, FrameLimits, ReceivedMessage},
     fs::FsMessage,
+    lsp::{AuthorityIdentity, LspContext, LspRequestId, LspV1},
     process::ProcessMessage,
     pty::{PtyMessage, PtyStreamContext, StreamId},
     Message, ProtocolVersion, CURRENT_VERSION,
@@ -25,6 +26,8 @@ use uuid::Uuid;
 const OUTBOUND_QUEUE: usize = 128;
 const PTY_STREAM_QUEUE: usize = 32;
 const MAX_PENDING_REQUESTS: usize = 64;
+const LSP_STREAM_QUEUE: usize = 16;
+const MAX_LSP_PENDING: usize = 64;
 
 fn encode_version(version: ProtocolVersion) -> u16 {
     u16::from_be_bytes([version.major, version.minor])
@@ -67,6 +70,8 @@ struct Inner {
     outbound: mpsc::Sender<Message>,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<ReceivedMessage>>>,
     pty_streams: Mutex<HashMap<PtyStreamContext, mpsc::Sender<RoutedPtyMessage>>>,
+    lsp_pending: Mutex<HashMap<(AuthorityIdentity, LspRequestId), oneshot::Sender<ReceivedMessage>>>,
+    lsp_streams: Mutex<HashMap<(AuthorityIdentity, LspContext), mpsc::Sender<ReceivedMessage>>>,
     child: Mutex<Child>,
     alive: AtomicBool,
     protocol_version: AtomicU16,
@@ -93,6 +98,8 @@ impl Multiplexer {
             outbound,
             pending: Mutex::new(HashMap::new()),
             pty_streams: Mutex::new(HashMap::new()),
+            lsp_pending: Mutex::new(HashMap::new()),
+            lsp_streams: Mutex::new(HashMap::new()),
             child: Mutex::new(child),
             alive: AtomicBool::new(true),
             protocol_version: AtomicU16::new(encode_version(CURRENT_VERSION)),
@@ -356,6 +363,58 @@ impl Multiplexer {
         Ok(receiver)
     }
 
+    pub(crate) async fn register_lsp(
+        &self,
+        context: LspContext,
+    ) -> Result<mpsc::Receiver<ReceivedMessage>, MultiplexerError> {
+        if !self.is_alive() {
+            return Err(MultiplexerError::Closed);
+        }
+        let auth = context.authority_identity.clone();
+        let key = (auth, context.clone());
+        let (sender, receiver) = mpsc::channel(LSP_STREAM_QUEUE);
+        let mut streams = self.inner.lsp_streams.lock().await;
+        if streams.contains_key(&key) {
+            return Err(MultiplexerError::DuplicateLspStream);
+        }
+        streams.insert(key, sender);
+        Ok(receiver)
+    }
+
+    pub fn unregister_lsp(&self, context: &LspContext) {
+        let auth = context.authority_identity.clone();
+        let key = (auth, context.clone());
+        let inner = Arc::clone(&self.inner);
+        if let Ok(mut streams) = inner.lsp_streams.try_lock() {
+            streams.remove(&key);
+            return;
+        }
+        tokio::spawn(async move {
+            inner.lsp_streams.lock().await.remove(&key);
+        });
+    }
+
+    pub(crate) async fn register_lsp_pending(
+        &self,
+        authority: AuthorityIdentity,
+        id: LspRequestId,
+    ) -> Result<oneshot::Receiver<ReceivedMessage>, MultiplexerError> {
+        if !self.is_alive() {
+            return Err(MultiplexerError::Closed);
+        }
+        let (sender, receiver) = oneshot::channel();
+        let mut pending = self.inner.lsp_pending.lock().await;
+        if pending.len() >= MAX_LSP_PENDING {
+            return Err(MultiplexerError::Backpressure);
+        }
+        let key = (authority, id);
+        if pending.contains_key(&key) {
+            return Err(MultiplexerError::DuplicateLspRequest);
+        }
+        pending.insert(key, sender);
+        Ok(receiver)
+    }
+
     pub async fn cancel_pty(&self, context: &PtyStreamContext) -> Result<(), MultiplexerError> {
         self.inner.pty_streams.lock().await.remove(context);
         self.send(Message::Pty(PtyMessage::Cancel {
@@ -395,6 +454,12 @@ async fn route_message(inner: &Arc<Inner>, received: ReceivedMessage) {
                     | PtyMessage::Resize { .. }
                     | PtyMessage::Cancel { .. }
             )
+            | Message::Lsp(
+                LspV1::Start { .. }
+                    | LspV1::Shutdown { .. }
+                    | LspV1::JsonRpcRequest { .. }
+                    | LspV1::WorkspaceEditResult { .. }
+            )
     ) {
         mark_lost(
             inner,
@@ -406,6 +471,33 @@ async fn route_message(inner: &Arc<Inner>, received: ReceivedMessage) {
     if let Some(request_id) = request_id {
         if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
             let _ = sender.send(received);
+        }
+        return;
+    }
+    if let Message::Lsp(lsp_message) = &received.message {
+        let context = lsp_message.context().clone();
+        let authority = context.authority_identity.clone();
+        if let LspV1::JsonRpcResponse { payload, .. } = lsp_message {
+            let key = (authority.clone(), payload.id.clone());
+            if let Some(sender) = inner.lsp_pending.lock().await.remove(&key) {
+                let _ = sender.send(received);
+                return;
+            }
+        }
+        let key = (authority, context.clone());
+        let sender = {
+            let mut streams = inner.lsp_streams.lock().await;
+            let terminal = matches!(lsp_message, LspV1::Exited { .. });
+            if terminal {
+                streams.remove(&key)
+            } else {
+                streams.get(&key).cloned()
+            }
+        };
+        if let Some(sender) = sender {
+            if sender.try_send(received).is_err() {
+                inner.lsp_streams.lock().await.remove(&key);
+            }
         }
         return;
     }
@@ -472,7 +564,11 @@ async fn mark_lost(inner: &Arc<Inner>, reason: String) {
             reason: reason.clone(),
         }));
     }
+    for (_, sender) in inner.lsp_streams.lock().await.drain() {
+        let _ = sender;
+    }
     inner.pending.lock().await.clear();
+    inner.lsp_pending.lock().await.clear();
     let _ = inner.loss.send(Some(TransportLoss { generation, reason }));
     let mut child = inner.child.lock().await;
     let _ = child.start_kill();
@@ -501,6 +597,10 @@ pub enum MultiplexerError {
     NegotiationTimeout,
     #[error("remote PTY stream context is invalid")]
     InvalidStreamContext,
+    #[error("duplicate LSP stream")]
+    DuplicateLspStream,
+    #[error("duplicate LSP request id")]
+    DuplicateLspRequest,
 }
 
 impl From<hermito_protocol::FrameError> for MultiplexerError {

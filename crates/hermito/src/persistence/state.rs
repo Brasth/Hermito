@@ -28,6 +28,10 @@ pub struct AppState {
     pub focus: String,
     /// Trust records (per workspace root + authority). Phase-1 uses "local" + inspect_only default.
     pub trust: Vec<TrustRecord>,
+    /// LSP execution grants (config-digest-scoped). Required for any LSP exec post-restore.
+    /// Terminal grants do not transfer to LSP. Uses default vec for old state files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lsp_grants: Vec<LspGrantRecord>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -56,6 +60,14 @@ pub struct TrustRecord {
     pub level: String,
 }
 
+/// Persisted grant for LSP execution on a specific authority for an exact effective config digest.
+/// Absent entry or digest mismatch after restore => LSP must be treated InspectOnly (even if terminal trust present).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LspGrantRecord {
+    pub workspace_root: PathBuf,
+    pub authority: String,
+    pub config_digest: String,
+}
 impl Default for AppState {
     fn default() -> Self {
         first_run_state()
@@ -94,6 +106,7 @@ pub fn first_run_state() -> AppState {
             kind: "local".to_string(),
             level: "inspect_only".to_string(),
         }],
+        lsp_grants: vec![],
     }
 }
 

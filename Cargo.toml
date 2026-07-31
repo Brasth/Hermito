@@ -18,6 +18,7 @@ ignore = "0.4"
 hex = "0.4"
 libc = "0.2"
 portable-pty = "0.9"
+lsp-types = "0.97"
 ratatui = { version = "0.30.2", features = ["crossterm"] }
 ropey = "1.6"
 serde = { version = "1.0", features = ["derive"] }

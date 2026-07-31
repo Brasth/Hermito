@@ -13,7 +13,7 @@ pub mod state;
 pub use journal::{
     recover_journal, start_journal_worker, JournalAck, JournalHandle, RecoveredBuffer, Recovery,
 };
-pub use state::{load_state, save_state, AppState, TabMetadata, TrustRecord};
+pub use state::{load_state, save_state, AppState, LspGrantRecord, TabMetadata, TrustRecord};
 
 /// Returns the platform-appropriate config directory for hermito state/journal/config.
 pub fn config_dir() -> PathBuf {

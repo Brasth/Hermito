@@ -56,6 +56,30 @@ pub fn map_key(key: KeyEvent, snapshot: &AppSnapshot) -> Option<Action> {
             _ => None,
         };
     }
+    if let crate::app::OverlaySnapshot::RenameInput { .. } = &snapshot.overlay {
+        return match key.code {
+            KeyCode::Char(c) => Some(Action::RenameOverlayInput(c)),
+            KeyCode::Backspace => Some(Action::RenameOverlayBackspace),
+            KeyCode::Enter => Some(Action::RenameOverlayConfirm),
+            KeyCode::Esc => Some(Action::RenameOverlayCancel),
+            _ => None,
+        };
+    }
+    if let crate::app::OverlaySnapshot::Completion { .. } = &snapshot.overlay {
+        return match key.code {
+            KeyCode::Tab | KeyCode::Down => Some(Action::NextControl),
+            KeyCode::BackTab | KeyCode::Up => Some(Action::PrevControl),
+            KeyCode::Enter => Some(Action::ActivateFocused),
+            KeyCode::Esc => Some(Action::CancelModal),
+            _ => None,
+        };
+    }
+    if let crate::app::OverlaySnapshot::Hover { .. } = &snapshot.overlay {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Enter => Some(Action::CancelModal),
+            _ => None,
+        };
+    }
     if let crate::app::OverlaySnapshot::SaveAs { .. } = &snapshot.overlay {
         return match key.code {
             KeyCode::Char(c) => Some(Action::SaveAsOverlayInput(c)),
@@ -95,6 +119,14 @@ pub fn map_key(key: KeyEvent, snapshot: &AppSnapshot) -> Option<Action> {
             Some(Action::OpenCommandPalette)
         }
         KeyCode::Char('s') | KeyCode::Char('S') if is_ctrl_or_cmd => Some(Action::Save),
+        KeyCode::Char(' ') if is_ctrl_or_cmd => Some(Action::RequestCompletion),
+        KeyCode::Char('h') | KeyCode::Char('H')
+            if is_ctrl_or_cmd && mods.contains(KeyModifiers::SHIFT) =>
+        {
+            Some(Action::RequestHover)
+        }
+        KeyCode::F(12) => Some(Action::RequestDefinition),
+        KeyCode::F(2) => Some(Action::RequestRename),
         KeyCode::Esc => Some(Action::CancelModal),
         KeyCode::Enter => {
             if snapshot.focus == Landmark::Authority {

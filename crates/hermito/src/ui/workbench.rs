@@ -89,11 +89,21 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &AppSnapshot) {
             ..
         } => render_command_palette_overlay(frame, query, items, *selected),
         OverlaySnapshot::SaveAs { path, .. } => render_save_as_overlay(frame, path),
+        OverlaySnapshot::RenameInput { new_name, .. } => {
+            render_rename_input_overlay(frame, new_name)
+        }
         OverlaySnapshot::SshPassphrase {
             authority_label,
             length,
             ..
         } => render_ssh_passphrase_overlay(frame, authority_label, *length),
+        OverlaySnapshot::Completion {
+            position,
+            candidates,
+            selected,
+            ..
+        } => render_completion_overlay(frame, *position, candidates, *selected),
+        OverlaySnapshot::Hover { document, .. } => render_hover_overlay(frame, document),
     }
 }
 
@@ -404,6 +414,71 @@ pub fn render_command_palette_overlay(
     );
 }
 
+fn render_completion_overlay(
+    frame: &mut Frame<'_>,
+    position: lsp_types::Position,
+    candidates: &[crate::app::CompletionCandidateSnapshot],
+    selected: usize,
+) {
+    let area = centered(frame.area(), 68, 12);
+    frame.render_widget(Clear, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("Completions · {}:{}", position.line + 1, position.character + 1),
+            theme::header().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Tab/↑/↓: select  •  Enter: insert  •  Esc: dismiss"),
+        Line::from(""),
+    ];
+    for (index, candidate) in candidates
+        .iter()
+        .take(area.height.saturating_sub(5) as usize)
+        .enumerate()
+    {
+        let detail = candidate
+            .detail
+            .as_deref()
+            .map(|detail| format!("  {detail}"))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!("{} {}{detail}", if index == selected { ">" } else { " " }, candidate.label),
+            if index == selected {
+                theme::selected()
+            } else {
+                theme::surface()
+            },
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(theme::surface()).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title("Completion")
+                .border_style(Style::new().fg(theme::FOCUS))
+                .style(theme::surface()),
+        ),
+        area,
+    );
+}
+
+fn render_hover_overlay(frame: &mut Frame<'_>, document: &str) {
+    let area = centered(frame.area(), 72, 16);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(document)
+            .style(theme::surface())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::new()
+                    .title("Hover · Esc to dismiss")
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(theme::FOCUS))
+                    .style(theme::surface()),
+            ),
+        area,
+    );
+}
+
 fn centered(area: Rect, max_width: u16, max_height: u16) -> Rect {
     let width = max_width.min(area.width.saturating_sub(4)).max(1);
     let height = max_height.min(area.height.saturating_sub(2)).max(1);
@@ -434,6 +509,29 @@ pub fn render_save_as_overlay(frame: &mut Frame<'_>, path: &str) {
         .style(theme::surface())
         .wrap(Wrap { trim: true });
     frame.render_widget(p, area);
+}
+
+fn render_rename_input_overlay(frame: &mut Frame<'_>, new_name: &str) {
+    let area = centered(frame.area(), 60, 5);
+    frame.render_widget(Clear, area);
+    let display = if new_name.is_empty() {
+        "New name >\nEnter: rename  •  Esc: cancel  •  Backspace".to_string()
+    } else {
+        format!("New name > {new_name}")
+    };
+    frame.render_widget(
+        Paragraph::new(display)
+            .block(
+                Block::default()
+                    .title("Rename Symbol")
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(theme::FOCUS))
+                    .style(theme::surface()),
+            )
+            .style(theme::surface())
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 pub fn render_ssh_passphrase_overlay(frame: &mut Frame<'_>, authority_label: &str, length: usize) {

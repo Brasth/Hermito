@@ -43,19 +43,26 @@ Implements the minimal capability-gated LSP 3.17 client in the host modular mono
 
 The LSP subsystem lives behind the single Authority trait. Spawn/probe/restart requires a grant scoped to workspace, authority identity, and effective server-config hash; inspect-only exposes static editor intelligence plus a blocked reason.
 
-`LspSupervisor` owns one client per `(workspace, ExecutionContextV1, language_id)` and manages capability intersection, document ledgers, bounded restart, and service state.
+`LspSupervisor` owns one client per `(workspace, authority identity, ExecutionContextV1, language_id)` and manages capability intersection, document ledgers, bounded restart, and service state. `ExecutionContextV1::AuthorityRoot` remains the canonical wire context for both Local and SSH; authority identity is a host-side isolation key.
 
-AuthorityRoot Local spawns a configured server directly. AuthorityRoot SSH sends canonical `ProtocolV1::Lsp` frames to the signed helper. Phase 5 DevContainer routing sends those same frames and `ExecutionContextV1::DevContainer` through the helper's canonical container dispatcher, which performs fixed `devcontainer exec`; it does not add an LSP protocol.
+AuthorityRoot Local spawns a configured server directly. AuthorityRoot SSH sends canonical `Message::Lsp(lsp::LspV1)` frames to the signed helper. Phase 5 DevContainer routing sends those same frames and `ExecutionContextV1::DevContainer` through the helper's canonical container dispatcher, which performs fixed `devcontainer exec`; it does not add an LSP protocol.
 
 LspClient performs JSON-RPC over the transport using lsp_types structs. 
 
-DocumentRegistry / RevisionedDocument (crates/hermito/src/document.rs) owns authoritative text + revision counter + sent_version ledger + session_generation + per-authority epoch. On edit: increment revision + sent_version, send didChange carrying current ledger values. 
+The existing Rope-backed `Buffer` is the sole authoritative text and revision owner. It holds an authority-keyed sent-version/session-generation ledger and emits accepted-edit snapshots for bounded didChange delivery; no parallel document registry is introduced.
 
 On every incoming publishDiagnostics/response: validate against document's sent-version + session-generation + revision + environment epoch (use server-provided diagnostic.version when present for matching; safe discard + optional refresh for versionless). Frames (local + remote) always carry epoch + session. 
 
 CoordinateMapper (crates/hermito/src/lsp/coordinate.rs) is single source for all position math. 
 
-Services registers supervisor state (including InspectOnlyBlocked). Problems consumes filtered NormalizedDiagnostic from diagnostics.rs. Rename (and any write) applies WorkspaceEdit through Authority mutation (respecting trust; blocked early on inspect-only). All paths use canonical crates/hermito* paths.
+App-owned diagnostic and language-service stores project filtered `NormalizedDiagnostic` and supervisor state (including InspectOnlyBlocked) into Problems and Services snapshots; the existing status count and service string remain derived summaries. Rename (and any write) applies a transactional `WorkspaceEdit` batch through Authority mutation, validating all paths, revisions, and trust before commit and never silently committing a partial multi-file edit.
+
+### Approved Review Corrections
+
+- Persisted execution trust is scoped to the canonical effective language-server configuration digest. A restored grant with no digest or a digest mismatch is InspectOnly; no Local or SSH probe, argv construction, or spawn may occur before the digest matches.
+- `Message::Lsp(lsp::LspV1)` replaces the opaque `ExtensionMessage` LSP slot. The protocol exports one typed LSP family; the remote dispatcher and host multiplexer are updated atomically. The multiplexer correlates bounded LSP responses and independently streams bounded LSP notifications without treating them as unsupported protocol traffic.
+- The authority exposes one transactional workspace-edit mutation carrying all relative paths, expected revisions, and replacements. Local, SSH protocol, and the helper validate the entire batch then stage/commit or compensate as one operation before rename is enabled.
+- Integration gates live in `crates/hermito/tests` and are invoked with `cargo test -p hermito --test <name>`; fixtures are resolved from `CARGO_MANIFEST_DIR`.
 
 - Cargo.toml (root workspace; member crates/hermito depends on ropey, lsp-types, serde_json, tokio, futures-util, unicode-segmentation)
 - crates/hermito-protocol/src/lsp.rs (the sole `LspV1` request/response schema; every message carries `ExecutionContextV1`)
@@ -67,7 +74,7 @@ Services registers supervisor state (including InspectOnlyBlocked). Problems con
 - crates/hermito/src/lsp/coordinate.rs (CoordinateMapper with exact byte/UTF-16 mappings plus canonical grapheme/display-cell snap semantics and exhaustive tests)
 - crates/hermito/src/lsp/diagnostics.rs (NormalizedDiagnostic conversion from lsp_types::Diagnostic, severity mapping, routing to Problems store; ledger-aware using server version or safe discard)
 - crates/hermito/src/lsp/requests.rs (CompletionProvider, HoverProvider, DefinitionProvider, RenameProvider; behind capability guard + execution trust for server calls)
-- crates/hermito/src/document.rs (RevisionedDocument { rope: Rope, revision: AtomicU64, sent_version: AtomicU32, session_generation: AtomicU64, ... }, apply_change, ledger accessors, to_lsp..., get_versioned_id)
+- crates/hermito/src/buffer.rs (`Buffer` remains the authoritative Rope/revision owner and adds authority-keyed LSP ledger plus accepted-edit snapshots)
 - crates/hermito/src/workspace.rs (Workspace, Environment { id, epoch: u64 })
 - crates/hermito/src/config/language.rs (user-owned `LanguageServerConfig`: executable, fixed args, version-probe args, expected version range/digest, associations, per-context overrides; repository files cannot define executable/init options)
 - tests/fixtures/lsp/typescript/package.json
@@ -80,13 +87,13 @@ Services registers supervisor state (including InspectOnlyBlocked). Problems con
 - tests/fixtures/lsp/go/main.go
 - tests/fixtures/lsp/python/pyproject.toml
 - tests/fixtures/lsp/python/main.py
-- tests/lsp_integration.rs (per-lang per-feature + rename verification + stale/ledger drop tests using versioned protocol)
-- tests/lsp_coordinate.rs (unicode matrix release gate tests)
+- crates/hermito/tests/lsp_integration.rs (per-language per-feature + rename verification + stale/ledger drop tests using versioned protocol)
+- crates/hermito/tests/lsp_coordinate.rs (unicode matrix release gate tests)
 
 ## Implementation Steps
 
 1. Update Cargo.toml (root workspace and crates/hermito) to add direct dependencies: ropey, lsp-types (pin after spike to version exposing full 3.17 structs), serde_json, tokio (process + io + sync), futures-util, unicode-segmentation. Do not enable proposed features until after fixture qualification. Record exact versions in Cargo.lock only after passing local + cross-platform build and test gates.
-2. Extend the Phase 2 protocol with one canonical `ProtocolV1::Lsp(LspV1...)` request/response family. Include `ExecutionContextV1`, epochs, session generation, and document ledger fields; round-trip both AuthorityRoot and reserved DevContainer contexts. Do not create local/SSH/container-specific LSP wire types.
+2. Replace the opaque LSP slot with one canonical `Message::Lsp(lsp::LspV1)` request/response family. Include `ExecutionContextV1`, epochs, authority identity, session generation, and document ledger fields; round-trip both AuthorityRoot and reserved DevContainer contexts. Update the remote dispatcher and host multiplexer together; do not create local/SSH/container-specific LSP wire types or a parallel protocol wrapper.
 3. Implement the helper's canonical LSP handler. For AuthorityRoot, resolve/probe the user-configured server remotely only after scoped trust, record identity/version, spawn with fixed argv/cwd/minimal environment, and bridge capped JSON-RPC. Keep the handler context-neutral so Phase 5 can invoke it after container dispatch.
 4. Extend Authority with `start_lsp`/send/receive using the canonical envelope. Local executes directly; SSH dispatches over Phase 2. Guard against missing trust or config-hash drift before any probe or argv construction. Declare, but do not implement here, the Phase 5 DevContainer execution adapter.
 5. Extend the Phase 1 Rope-backed `Buffer`/document model with sent-version and session-generation ledgers; do not recreate or fork document ownership. Host memory remains authoritative.
@@ -94,13 +101,13 @@ Services registers supervisor state (including InspectOnlyBlocked). Problems con
 7. Implement crates/hermito/src/lsp/client.rs LspClient. pending keyed by (sent_version, session, rev, epoch). Guard requests. On incoming: match sent-version/session/rev/epoch (prefer server diag version for publishDiagnostics); apply safe discard + request-refresh policy on versionless; drop mismatch. Convert positions.
 7a. Implement capped JSON-RPC ingress: reject oversized `Content-Length` before buffer allocation, cap aggregate pending bytes, then validate IDs, numeric ranges, strings, arrays, diagnostics, and workspace edits in DTOs before model conversion.
 8. Implement LspSupervisor. InspectOnly returns a no-execution service state. Trusted execution resolves the user-configured binary inside the selected execution context, verifies configured digest/version constraints, records identity and advertised capabilities, starts the canonical session, watches exit, and permits at most three bounded restarts.
-9. Wire editor change (phase1): on mutate RevisionedDocument bump sent_version+rev, authority.lsp_did_change (skipped if !trusted). didOpen only on trusted.
+9. Wire editor change from the existing `Buffer` mutation boundary: on accepted mutation bump its authority-keyed sent_version+revision ledger and queue `authority.lsp_did_change` (skipped if !trusted). didOpen only on trusted.
 10. Implement crates/hermito/src/lsp/requests.rs providers guarded by capability + execution trust (any server call). rename etc use authority writes (blocked on inspect).
 11. Implement crates/hermito/src/lsp/diagnostics.rs : convert, on publish (filtered by ledger using server version when present or safe policy), update store. Versionless -> discard or refresh.
 12. Implement user-owned language TOML. Reject repository-provided executable/init-option configuration, hash the effective config into the trust scope, and require an explicit new grant after executable/argv/init-option changes.
 13. Create four certified fixture trees (listed in Related): minimal self-contained for the ops.
-14. Add tests/lsp_integration.rs exercising on trusted Local: full lifecycle + rename + post verify. Separate matrix: stale sent-version, versionless diags policy, session-gen bump, ProtocolV1 variant roundtrip on wire, epoch reject. SSH path too.
-15. Add `tests/lsp_coordinate.rs` for exact-domain and canonical-snap Unicode laws, plus `tests/lsp_hostile_json.rs` for numeric-range and allocation-limit rejection; both are release gates.
+14. Add `crates/hermito/tests/lsp_integration.rs` exercising on trusted Local: full lifecycle + rename + post verify. Separate matrix: stale sent-version, versionless diags policy, session-gen bump, typed `Message::Lsp` roundtrip on wire, epoch reject, and SSH path.
+15. Add `crates/hermito/tests/lsp_coordinate.rs` for exact-domain and canonical-snap Unicode laws, plus `crates/hermito/tests/lsp_hostile_json.rs` for numeric-range and allocation-limit rejection; both are release gates.
 16. Connect states (incl. blocked) to Services/Problems (phase1). Inspect-only shows static+blocked.
 17. Graceful paths: no trust or no binary -> no LS session; static intelligence + clear blocked message in UI/Services.
 18. Tracing on all: trust decision at spawn, ledger decisions, variant dispatch, blocked reasons.

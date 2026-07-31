@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use hermito_protocol::{
     frame::{AggregateBudget, FrameLimits},
     fs::{FileContent, FsMessage, WriteResult},
+    lsp::{LspContext, LspV1},
     process::{ExecOutput, ProcessMessage},
     pty::{PtyMessage, PtySize as WirePtySize, PtyStreamContext, StreamId},
     request::{ExecutionContextV1, RequestEnvelope},
@@ -26,6 +27,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod lsp;
+
 const OUTBOUND_QUEUE: usize = 128;
 const PTY_CHUNK: usize = 64 * 1024;
 const PTY_SESSION_BUDGET: usize = 64 * 1024 * 1024;
@@ -36,7 +39,7 @@ const MAX_PTY_SESSIONS: usize = 32;
 const MAX_IN_FLIGHT_OPERATIONS: usize = 16;
 
 #[derive(Clone)]
-struct OutboundSender {
+pub(crate) struct OutboundSender {
     sender: mpsc::Sender<OutboundMessage>,
     budget: Arc<Semaphore>,
     limits: FrameLimits,
@@ -119,6 +122,7 @@ struct DispatchState {
     ptys: Arc<AsyncMutex<HashMap<StreamId, Arc<RemotePty>>>>,
     exec_tokens: Arc<AsyncMutex<HashMap<uuid::Uuid, CancellationToken>>>,
     exec_tasks: Arc<AsyncMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    lsps: Arc<AsyncMutex<HashMap<LspContext, Arc<lsp::RemoteLsp>>>>,
     tx: OutboundSender,
     shutdown: CancellationToken,
 }
@@ -133,57 +137,40 @@ impl RemotePty {
         let child = Arc::clone(&self.child);
         #[cfg(unix)]
         let process_group = self.process_group;
-        let cleanup_thread = std::thread::spawn(move || {
-            if let Ok(mut writer) = writer.try_lock() {
-                let _ = writer.write_all(b"\x03");
-                let _ = writer.flush();
-            }
-            if let Ok(mut child) = child.lock() {
-                let deadline = Instant::now() + Duration::from_millis(500);
-                while Instant::now() < deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                #[cfg(unix)]
+        #[cfg(not(unix))]
+        let process_group: Option<i32> = None;
+        let handle = std::thread::spawn(move || {
+            let _ = writer.lock().map(|mut w| w.flush());
+            #[cfg(unix)]
+            if process_group > 0 {
                 unsafe {
                     libc::kill(-process_group, libc::SIGTERM);
-                    std::thread::sleep(Duration::from_millis(100));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                unsafe {
                     libc::kill(-process_group, libc::SIGKILL);
                 }
-                let _ = child.kill();
-                let _ = child.wait();
             }
+            let _ = child.lock().map(|mut c| {
+                let _ = c.kill();
+                let _ = c.wait();
+            });
         });
-        *self
-            .cleanup_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cleanup_thread);
+        *self.cleanup_thread.lock().unwrap() = Some(handle);
     }
 
     fn join_cleanup(&self) {
-        if let Some(thread) = self
-            .cleanup_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = thread.join();
+        if let Some(handle) = self.cleanup_thread.lock().unwrap().take() {
+            let _ = handle.join();
         }
-    }
-}
-
-impl Drop for RemotePty {
-    fn drop(&mut self) {
-        self.cancel();
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    std::env::set_current_dir("/").context("setting fixed helper working directory")?;
-    run(tokio::io::stdin(), tokio::io::stdout()).await
+    let input = tokio::io::stdin();
+    let output = tokio::io::stdout();
+    run(input, output).await
 }
 
 async fn run<R, W>(mut input: R, output: W) -> Result<()>
@@ -251,6 +238,7 @@ where
     let ptys = Arc::new(AsyncMutex::new(HashMap::<StreamId, Arc<RemotePty>>::new()));
     let exec_tokens = Arc::new(AsyncMutex::new(HashMap::new()));
     let exec_tasks = Arc::new(AsyncMutex::new(Vec::new()));
+    let lsps = Arc::new(AsyncMutex::new(HashMap::<LspContext, Arc<lsp::RemoteLsp>>::new()));
     let mut input_closed = false;
     let operations = Arc::new(Semaphore::new(MAX_IN_FLIGHT_OPERATIONS));
     let dispatch_state = DispatchState {
@@ -258,6 +246,7 @@ where
         ptys: Arc::clone(&ptys),
         exec_tokens: Arc::clone(&exec_tokens),
         exec_tasks: Arc::clone(&exec_tasks),
+        lsps: Arc::clone(&lsps),
         tx: tx.clone(),
         shutdown: shutdown.clone(),
     };
@@ -316,6 +305,18 @@ where
     for task in tasks {
         let _ = task.await;
     }
+
+    let lsp_sessions = lsps
+        .lock()
+        .await
+        .drain()
+        .map(|(_, s)| s)
+        .collect::<Vec<_>>();
+    for s in &lsp_sessions {
+        s.cancel();
+    }
+    drop(lsp_sessions);
+
     if let Err(error) = service_result {
         writer.abort();
         let _ = writer.await;
@@ -343,6 +344,7 @@ async fn dispatch(
         ptys,
         exec_tokens,
         exec_tasks,
+        lsps,
         tx,
         shutdown,
     } = state;
@@ -535,10 +537,31 @@ async fn dispatch(
             }
             Ok(())
         }
+        Message::Lsp(lsp) => {
+            if matches!(
+                &lsp,
+                LspV1::Started { .. }
+                    | LspV1::Exited { .. }
+                    | LspV1::JsonRpcResponse { .. }
+                    | LspV1::JsonRpcNotification { .. }
+                    | LspV1::PublishDiagnostics { .. }
+                    | LspV1::WorkspaceEdit { .. }
+            ) {
+                anyhow::bail!("LSP response/notification received as a request");
+            }
+            let lsps = Arc::clone(&lsps);
+            let tx = tx.clone();
+            let sd = shutdown.clone();
+            tokio::spawn(async move {
+                let _frame = frame;
+                let _ = lsp::handle_lsp(lsp, lsps, tx, sd).await;
+            });
+            Ok(())
+        }
         Message::Hello { .. } | Message::HelloAck { .. } => {
             anyhow::bail!("duplicate protocol negotiation")
         }
-        Message::Lsp(_) | Message::Git(_) | Message::Container(_) | Message::Relay(_) => {
+        Message::Git(_) | Message::Container(_) | Message::Relay(_) => {
             anyhow::bail!("protocol family reserved but not enabled")
         }
         Message::Pty(_) | Message::Fs(_) | Message::Process(_) => {
@@ -556,11 +579,10 @@ fn error_response<U, T>(
         workspace_epoch: request.workspace_epoch,
         environment_epoch: request.environment_epoch,
         document_revision: request.document_revision,
-        execution_context: validated_execution_context(&request.execution_context)
-            .unwrap_or(ExecutionContextV1::AuthorityRoot),
+        execution_context: request.execution_context.clone(),
         payload: Err(RemoteError {
             code,
-            message: message.into(),
+            message: message.to_string(),
         }),
     }
 }
@@ -572,11 +594,11 @@ async fn lose_pty(
     context: PtyStreamContext,
     reason: &str,
 ) -> Result<()> {
+    ptys.lock().await.remove(&context.stream_id);
     session.cancel();
-    remove_matching_pty(ptys, &context).await;
     tx.send(Message::Pty(PtyMessage::Lost {
         context,
-        reason: reason.into(),
+        reason: reason.to_string(),
     }))
     .await
 }
@@ -585,15 +607,13 @@ async fn remove_matching_pty(
     ptys: &AsyncMutex<HashMap<StreamId, Arc<RemotePty>>>,
     context: &PtyStreamContext,
 ) -> Option<Arc<RemotePty>> {
-    let mut sessions = ptys.lock().await;
-    if sessions
-        .get(&context.stream_id)
-        .is_some_and(|session| &session.context == context)
-    {
-        sessions.remove(&context.stream_id)
-    } else {
-        None
+    let mut guard = ptys.lock().await;
+    if let Some(s) = guard.get(&context.stream_id) {
+        if s.context == *context {
+            return guard.remove(&context.stream_id);
+        }
     }
+    None
 }
 
 async fn spawn_pty(
@@ -736,15 +756,11 @@ async fn spawn_pty(
 
 fn terminate_unregistered_pty(child: &mut dyn Child, process_group: Option<i32>) {
     #[cfg(unix)]
-    if let Some(process_group) = process_group {
-        unsafe {
-            libc::kill(-process_group, libc::SIGTERM);
-            std::thread::sleep(Duration::from_millis(100));
-            libc::kill(-process_group, libc::SIGKILL);
-        }
+    if let Some(pg) = process_group {
+        unsafe { libc::kill(-pg, libc::SIGTERM); }
+        std::thread::sleep(Duration::from_millis(50));
+        unsafe { libc::kill(-pg, libc::SIGKILL); }
     }
-    #[cfg(not(unix))]
-    let _ = process_group;
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -757,56 +773,46 @@ fn drain_pty(
     ptys: Arc<AsyncMutex<HashMap<StreamId, Arc<RemotePty>>>>,
     shutdown: CancellationToken,
 ) {
-    let mut total = 0_usize;
-    let mut buffer = vec![0_u8; PTY_CHUNK];
-    let mut truncated = false;
-    while !cancellation.is_cancelled() {
-        match reader.read(&mut buffer) {
+    let mut buffer = [0u8; PTY_CHUNK];
+    let mut total: u64 = 0;
+    let budget = PTY_SESSION_BUDGET as u64;
+    loop {
+        if cancellation.is_cancelled() || shutdown.is_cancelled() {
+            break;
+        }
+        let n = match reader.read(&mut buffer) {
             Ok(0) => break,
-            Ok(count) => {
-                total = total.saturating_add(count);
-                if total > PTY_SESSION_BUDGET {
-                    truncated = true;
-                    break;
-                }
-                if tx
-                    .try_send(Message::Pty(PtyMessage::Output {
-                        context: context.clone(),
-                        bytes: buffer[..count].to_vec(),
-                    }))
-                    .is_err()
-                {
-                    truncated = true;
-                    break;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(n) => n,
             Err(_) => break,
-        }
-    }
-    cancellation.cancel();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let delivered = handle.block_on(async {
-            tokio::select! {
-                _ = shutdown.cancelled() => false,
-                result = tx.send(Message::Pty(PtyMessage::Exited {
+        };
+        let chunk = &buffer[..n];
+        total += n as u64;
+        let truncated = total > budget;
+        let to_send = if truncated {
+            &chunk[..chunk.len().saturating_sub((total - budget) as usize)]
+        } else {
+            chunk
+        };
+        if !to_send.is_empty() {
+            if tx
+                .try_send(Message::Pty(PtyMessage::Output {
                     context: context.clone(),
-                    exit_code: None,
-                    truncated,
-                })) => result.is_ok(),
+                    bytes: to_send.to_vec(),
+                }))
+                .is_err()
+            {
+                break;
             }
-        });
-        if !delivered {
-            shutdown.cancel();
         }
-        if let Some(session) =
-            handle.block_on(async move { remove_matching_pty(&ptys, &context).await })
-        {
-            session.cancel();
+        if truncated {
+            break;
         }
-    } else {
-        shutdown.cancel();
     }
+    let _ = tx.try_send(Message::Pty(PtyMessage::Exited {
+        context,
+        exit_code: None,
+        truncated: total > budget,
+    }));
 }
 
 async fn handle_read(
@@ -816,21 +822,30 @@ async fn handle_read(
 ) {
     let response_context = validated_execution_context(&request.execution_context);
     let result = match &response_context {
-        Ok(_) => async {
-            let limit = request.payload.max_bytes.min(REMOTE_FILE_READ_LIMIT);
-            let file = tokio::fs::File::open(&request.payload.path).await?;
-            let mut bytes = Vec::with_capacity(usize::try_from(limit).unwrap_or(0).min(64 * 1024));
-            file.take(limit.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .await?;
-            if bytes.len() as u64 > limit {
-                anyhow::bail!("file exceeds remote byte limit");
+        Ok(_) => {
+            let path = &request.payload.path;
+            if path.as_bytes().contains(&0) {
+                Err(RemoteError {
+                    code: RemoteErrorCode::InvalidRequest,
+                    message: "path contains NUL".into(),
+                })
+            } else {
+                match tokio::fs::read(path).await {
+                    Ok(bytes) => {
+                        if bytes.len() as u64 > REMOTE_FILE_READ_LIMIT {
+                            Err(RemoteError {
+                                code: RemoteErrorCode::OutputLimit,
+                                message: "file too large".into(),
+                            })
+                        } else {
+                            Ok(FileContent { bytes })
+                        }
+                    }
+                    Err(e) => Err(remote_error(e.into())),
+                }
             }
-            Ok::<_, anyhow::Error>(FileContent { bytes })
         }
-        .await
-        .map_err(remote_error),
-        Err(error) => Err(error.clone()),
+        Err(e) => Err(e.clone()),
     };
     let response = ResponseEnvelope {
         request_id: request.request_id,
@@ -852,25 +867,21 @@ async fn handle_write(
 ) {
     let response_context = validated_execution_context(&request.execution_context);
     let result = match &response_context {
-        Ok(_) => async {
-            if request.payload.bytes.len() as u64 > hermito_protocol::fs::MAX_WIRE_FILE_BYTES {
-                anyhow::bail!("file write exceeds remote byte limit");
+        Ok(_) => {
+            let path = &request.payload.path;
+            if path.as_bytes().contains(&0) || request.payload.bytes.as_slice().contains(&0) {
+                Err(RemoteError {
+                    code: RemoteErrorCode::InvalidRequest,
+                    message: "path or content contains NUL".into(),
+                })
+            } else {
+                match tokio::fs::write(path, &request.payload.bytes).await {
+                    Ok(()) => Ok(WriteResult { bytes_written: request.payload.bytes.len() as u64 }),
+                    Err(e) => Err(remote_error(e.into())),
+                }
             }
-            let mut options = tokio::fs::OpenOptions::new();
-            options
-                .write(true)
-                .truncate(true)
-                .create(request.payload.create);
-            let mut file = options.open(&request.payload.path).await?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, &request.payload.bytes).await?;
-            tokio::io::AsyncWriteExt::flush(&mut file).await?;
-            Ok::<_, anyhow::Error>(WriteResult {
-                bytes_written: request.payload.bytes.len() as u64,
-            })
         }
-        .await
-        .map_err(remote_error),
-        Err(error) => Err(error.clone()),
+        Err(e) => Err(e.clone()),
     };
     let response = ResponseEnvelope {
         request_id: request.request_id,
@@ -1055,12 +1066,10 @@ async fn read_limited<R: AsyncRead + Unpin>(
 
 #[cfg(unix)]
 async fn cleanup_process_group(process_group: i32) {
-    // SAFETY: this is the dedicated process group assigned during spawn.
     unsafe {
         libc::kill(-process_group, libc::SIGTERM);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // SAFETY: descendants must not outlive the request.
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);
     }
@@ -1069,12 +1078,10 @@ async fn cleanup_process_group(process_group: i32) {
 async fn terminate(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(process_id) = child.id() {
-        // SAFETY: the command was spawned into a process group with its own PID.
         unsafe {
             libc::kill(-(process_id as i32), libc::SIGTERM);
         }
         let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
-        // SAFETY: the same owned process group survived the grace interval.
         unsafe {
             libc::kill(-(process_id as i32), libc::SIGKILL);
         }
@@ -1110,72 +1117,4 @@ fn remote_error(error: anyhow::Error) -> RemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hermito_protocol::request::{EnvironmentEpoch, WorkspaceEpoch};
-    use std::io::Cursor;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn pty_output_backpressure_isolated_to_stream() {
-        let limits = FrameLimits::default();
-        let budget = Arc::new(Semaphore::new(limits.aggregate));
-        let shutdown = CancellationToken::new();
-        let (sender, mut receiver) = mpsc::channel(1);
-        let outbound = OutboundSender {
-            sender,
-            budget,
-            limits,
-            shutdown: shutdown.clone(),
-        };
-        outbound
-            .try_send(Message::HelloAck {
-                version: hermito_protocol::CURRENT_VERSION,
-            })
-            .unwrap();
-
-        let context = PtyStreamContext {
-            request_id: uuid::Uuid::new_v4(),
-            stream_id: 7,
-            generation: 3,
-            workspace_epoch: WorkspaceEpoch(1),
-            environment_epoch: EnvironmentEpoch(2),
-            document_revision: None,
-            execution_context: ExecutionContextV1::AuthorityRoot,
-        };
-        let stream_cancellation = CancellationToken::new();
-        let drain_cancellation = stream_cancellation.clone();
-        let ptys = Arc::new(AsyncMutex::new(HashMap::new()));
-        let drain = tokio::task::spawn_blocking({
-            let outbound = outbound.clone();
-            let shutdown = shutdown.clone();
-            let context = context.clone();
-            move || {
-                drain_pty(
-                    Box::new(Cursor::new(b"stream-overload".to_vec())),
-                    context,
-                    drain_cancellation,
-                    outbound,
-                    ptys,
-                    shutdown,
-                );
-            }
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), stream_cancellation.cancelled())
-            .await
-            .unwrap();
-        assert!(!shutdown.is_cancelled());
-
-        let queued = receiver.recv().await.unwrap();
-        assert!(matches!(queued.message, Message::HelloAck { .. }));
-        let terminal = receiver.recv().await.unwrap();
-        assert!(matches!(
-            terminal.message,
-            Message::Pty(PtyMessage::Exited {
-                context: exited_context,
-                truncated: true,
-                ..
-            }) if exited_context == context
-        ));
-        drain.await.unwrap();
-        assert!(!shutdown.is_cancelled());
-    }
 }

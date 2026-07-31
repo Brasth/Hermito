@@ -20,8 +20,33 @@ const QUALIFIED_REMOTE_HELPER_TARGETS: [&str; 2] = [
     "hermito-remote-aarch64-unknown-linux-musl",
 ];
 
+const LSP_SUPERVISOR_EVENT_DRAIN_LIMIT: usize = 16;
+
 fn is_qualified_remote_helper_target(target: &str) -> bool {
     QUALIFIED_REMOTE_HELPER_TARGETS.contains(&target)
+}
+
+/// Apply a bounded batch of supervisor updates on the UI thread without
+/// delaying terminal input or rendering.
+fn drain_lsp_supervisor_events(app: &mut App) {
+    for _ in 0..LSP_SUPERVISOR_EVENT_DRAIN_LIMIT {
+        match app.try_recv_language_service_event() {
+            Ok(event) => app.apply_language_service_event(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+fn drain_lsp_runtime_events(app: &mut App) {
+    for _ in 0..LSP_SUPERVISOR_EVENT_DRAIN_LIMIT {
+        match app.try_recv_lsp_runtime_event() {
+            Ok(event) => app.apply_lsp_runtime_event(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    app.flush_pending_lsp_changes();
 }
 
 /// Result of off-thread atomic file save. Only success + exact rev/epoch match will mark clean + Saved + compact.
@@ -407,6 +432,7 @@ fn spawn_local_terminal(
     launch_id: u64,
     rows: u16,
     cols: u16,
+    lsp_grants: Vec<crate::persistence::state::LspGrantRecord>,
     tx: std::sync::mpsc::SyncSender<TerminalStartResult>,
 ) {
     std::thread::spawn(move || {
@@ -425,6 +451,7 @@ fn spawn_local_terminal(
                 hermito_protocol::WorkspaceEpoch(epoch.0),
             )
             .map_err(|error| error.to_string())?;
+            crate::app::apply_persisted_lsp_grants(&lsp_grants, root.as_path(), &authority);
             authority.grant_execution();
             let command = crate::pty::default_shell_command(&root);
             let request = AuthorityRequest::new(
@@ -490,7 +517,8 @@ fn dispatch_terminal_start(
             launch_id,
             rows,
             cols,
-        } => spawn_local_terminal(root, epoch, launch_id, rows, cols, tx),
+            lsp_grants,
+        } => spawn_local_terminal(root, epoch, launch_id, rows, cols, lsp_grants, tx),
         crate::app::TerminalSpawnSpec::Remote {
             epoch,
             launch_id,
@@ -522,8 +550,10 @@ pub fn run_event_loop(
 
     // restore uses journal recovery (pre layout) + validated state for layout/trust/tabs/cursor/scroll
     let mut app = App::restore_state(initial_state, recovery, journal.clone());
+    let config = crate::config::load()?;
+    app.configure_language_servers(config.language_servers);
     let mut configured_ssh = std::collections::HashMap::new();
-    for config in crate::config::load()?.ssh_authorities {
+    for config in config.ssh_authorities {
         let configured_label = config.label.clone();
         let (label, runtime) = configured_ssh_runtime(config, app.epoch).map_err(|error| {
             anyhow::anyhow!("invalid SSH authority {configured_label}: {error}")
@@ -624,6 +654,15 @@ pub fn run_event_loop(
     let mut last_tick = Instant::now();
 
     loop {
+        drain_lsp_supervisor_events(&mut app);
+        drain_lsp_runtime_events(&mut app);
+        if let Some(path) = app.take_pending_definition_open() {
+            let epoch = app.epoch;
+            app.apply_action(Action::RequestProjectFile { path: path.clone() });
+            if file_coalesce.on_request(path.clone(), epoch) {
+                spawn_project_file_read(path, epoch, file_tx.clone());
+            }
+        }
         // drain tagged project results (reject stale epoch in apply)
         while let Ok(pres) = project_rx.try_recv() {
             app.apply_action(Action::UpdateProjectState {
@@ -637,11 +676,15 @@ pub fn run_event_loop(
         while let Ok(fres) = file_rx.try_recv() {
             let matched = file_coalesce.on_result(&fres.path, fres.epoch);
             if matched {
+                let loaded = fres.content.is_some();
                 app.apply_action(Action::ProjectFileLoaded {
                     path: fres.path,
                     content: fres.content,
                     epoch: fres.epoch,
                 });
+                if loaded {
+                    app.start_language_service_for_current_document();
+                }
             }
             if !file_coalesce.has_in_flight() {
                 if let Some((p, e)) = file_coalesce.take_pending() {
@@ -730,6 +773,9 @@ pub fn run_event_loop(
             }
         }
         app.refresh_authority_connections();
+        // Connection state can change outside an input action; associate the
+        // current document only after the selected authority is usable.
+        app.start_language_service_for_current_document();
         // input
         match input_rx.try_recv() {
             Ok(ct_ev) => {
@@ -818,7 +864,17 @@ pub fn run_event_loop(
                     let should_disconnect_ssh = matches!(&act, Action::RevokeTrust);
                     let submitted_ssh_passphrase = matches!(&act, Action::SshPassphraseSubmit);
                     let affected_ssh_label = app.current_ssh_authority_label();
+                    let accepted_buffer_edit = matches!(
+                        &act,
+                        Action::ApplyBufferEdit { .. }
+                            | Action::EditorInsert(_)
+                            | Action::EditorPaste(_)
+                            | Action::EditorDeleteBackward
+                    );
                     app.apply_action(act);
+                    if accepted_buffer_edit {
+                        app.queue_current_lsp_change();
+                    }
                     if submitted_ssh_passphrase {
                         if let Some((label, passphrase)) = app.take_submitted_ssh_passphrase() {
                             if let std::collections::hash_map::Entry::Vacant(entry) =

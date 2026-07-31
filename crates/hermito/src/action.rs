@@ -45,6 +45,15 @@ pub enum Action {
         up: bool,
         extend: bool,
     },
+    // Language service navigation (only dispatched by a ready, trusted session).
+    RequestCompletion,
+    RequestHover,
+    RequestDefinition,
+    RequestRename,
+    RenameOverlayInput(char),
+    RenameOverlayBackspace,
+    RenameOverlayConfirm,
+    RenameOverlayCancel,
 
     // Mouse
     MouseDown {

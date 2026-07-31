@@ -3,9 +3,16 @@ use crate::buffer::{Buffer, CheckpointPayload};
 use crate::document::{BufferPathState, DocumentId, DocumentRevision, Language, WorkspaceEpoch};
 use crate::layout::{EditorTabState, Landmark, WorkbenchLayout};
 use crate::persistence::journal::{JournalAck, JournalHandle, RecoveredBuffer, Recovery};
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tree_sitter::Tree;
 use zeroize::Zeroizing;
+
+const LSP_SUPERVISOR_EVENT_CHANNEL_CAPACITY: usize = 64;
+const LSP_RUNTIME_EVENT_CHANNEL_CAPACITY: usize = 64;
+const LSP_SESSION_COMMAND_CHANNEL_CAPACITY: usize = 32;
+const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrustLevel {
@@ -51,6 +58,12 @@ pub struct EditorTabSnapshot {
     pub scroll_line: u16,
     pub highlights: Vec<crate::syntax::highlight::HighlightSpan>,
 }
+#[derive(Clone, Debug)]
+pub struct CompletionCandidateSnapshot {
+    pub label: String,
+    pub detail: Option<String>,
+}
+
 
 #[derive(Clone, Debug)]
 pub enum OverlaySnapshot {
@@ -73,9 +86,23 @@ pub enum OverlaySnapshot {
         path: String,
         invoker: Landmark,
     },
+    RenameInput {
+        new_name: String,
+        invoker: Landmark,
+    },
     SshPassphrase {
         authority_label: String,
         length: usize,
+        invoker: Landmark,
+    },
+    Completion {
+        position: lsp_types::Position,
+        candidates: Vec<CompletionCandidateSnapshot>,
+        selected: usize,
+        invoker: Landmark,
+    },
+    Hover {
+        document: String,
         invoker: Landmark,
     },
 }
@@ -124,6 +151,7 @@ pub(crate) enum TerminalSpawnSpec {
         launch_id: u64,
         rows: u16,
         cols: u16,
+        lsp_grants: Vec<crate::persistence::state::LspGrantRecord>,
     },
     Remote {
         epoch: WorkspaceEpoch,
@@ -132,6 +160,175 @@ pub(crate) enum TerminalSpawnSpec {
         authority: Arc<crate::authority::ssh::SshAuthority>,
         request: crate::authority::types::AuthorityRequest<crate::authority::types::PtyRequest>,
     },
+}
+
+struct AppLspTransport(Box<dyn crate::lsp::LspTransport>);
+
+impl crate::lsp::LspTransport for AppLspTransport {
+    fn send(
+        &self,
+        message: hermito_protocol::lsp::LspV1,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::lsp::LspClientError>> + Send + '_>,
+    > {
+        self.0.send(message)
+    }
+
+    fn recv(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<hermito_protocol::lsp::LspV1, crate::lsp::LspClientError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.0.recv()
+    }
+}
+fn send_workspace_edit_result(
+    client: Arc<crate::lsp::LspClient<AppLspTransport>>,
+    context: hermito_protocol::lsp::LspContext,
+    request_id: hermito_protocol::lsp::LspRequestId,
+    applied: bool,
+    reason: Option<&'static str>,
+) {
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(
+            LSP_REQUEST_TIMEOUT,
+            client.workspace_edit_result(context, request_id, applied, reason.map(str::to_owned)),
+        )
+        .await;
+    });
+}
+
+
+#[derive(Clone)]
+struct LspChange {
+    context: hermito_protocol::lsp::LspContext,
+    uri: String,
+    version: i32,
+    text: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LspProviderKind {
+    Completion,
+    Hover,
+    Definition,
+    RenamePreparation,
+    Rename,
+}
+
+#[derive(Clone)]
+struct LspProviderSnapshot {
+    context: hermito_protocol::lsp::LspContext,
+    uri: String,
+    revision: DocumentRevision,
+    ledger: crate::lsp::LspDocumentLedger,
+    config_digest: String,
+    service_state: crate::lsp::LanguageServiceState,
+}
+
+pub(crate) enum LspProviderResult {
+    ReadOnly(crate::lsp::ProviderOutcome),
+    RenamePrepared(Option<crate::lsp::RenamePreparation>),
+    RenameWorkspaceEdit(crate::lsp::RenameRequestOutcome),
+}
+
+enum LspSessionCommand {
+    Change(LspChange),
+    Provider {
+        kind: LspProviderKind,
+        snapshot: LspProviderSnapshot,
+        position: lsp_types::Position,
+    },
+    Rename {
+        snapshot: LspProviderSnapshot,
+        preparation: crate::lsp::RenamePreparation,
+        position: lsp_types::Position,
+        new_name: String,
+    },
+}
+
+struct LspSession {
+    command_tx: tokio::sync::mpsc::Sender<LspSessionCommand>,
+    cancellation: tokio_util::sync::CancellationToken,
+    context: hermito_protocol::lsp::LspContext,
+    pending_change: Option<LspChange>,
+    config_digest: String,
+}
+
+pub(crate) enum LspRuntimeEvent {
+    State {
+        key: crate::lsp::SupervisorKey,
+        context: hermito_protocol::lsp::LspContext,
+        state: crate::lsp::LanguageServiceState,
+    },
+    Initialized {
+        key: crate::lsp::SupervisorKey,
+        context: hermito_protocol::lsp::LspContext,
+    },
+    TransportLoss {
+        key: crate::lsp::SupervisorKey,
+        context: hermito_protocol::lsp::LspContext,
+        detail: String,
+    },
+    Restart {
+        key: crate::lsp::SupervisorKey,
+        generation: hermito_protocol::lsp::SessionGeneration,
+    },
+    Diagnostics {
+        key: crate::lsp::SupervisorKey,
+        document_id: DocumentId,
+        context: hermito_protocol::lsp::LspContext,
+        uri: String,
+        version: Option<i32>,
+        diagnostics: Vec<hermito_protocol::lsp::LspDiagnostic>,
+    },
+    WorkspaceEdit {
+        key: crate::lsp::SupervisorKey,
+        document_id: DocumentId,
+        context: hermito_protocol::lsp::LspContext,
+        request_id: hermito_protocol::lsp::LspRequestId,
+        edit: hermito_protocol::lsp::TransactionalWorkspaceEdit,
+        client: Arc<crate::lsp::LspClient<AppLspTransport>>,
+    },
+    ProviderResult {
+        key: crate::lsp::SupervisorKey,
+        document_id: DocumentId,
+        context: hermito_protocol::lsp::LspContext,
+        revision: DocumentRevision,
+        position: lsp_types::Position,
+        kind: LspProviderKind,
+        result: Result<LspProviderResult, String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProblemDiagnostic {
+    pub document_id: DocumentId,
+    pub uri: String,
+    pub range: lsp_types::Range,
+    pub severity: Option<crate::lsp::NormalizedDiagnosticSeverity>,
+    pub message: String,
+    pub source: Option<String>,
+}
+
+/// Restore only grants scoped to this exact workspace and canonical authority
+/// identity. UI labels are intentionally excluded from this trust boundary.
+pub(crate) fn apply_persisted_lsp_grants<A: crate::authority::Authority + ?Sized>(
+    grants: &[crate::persistence::state::LspGrantRecord],
+    workspace_root: &std::path::Path,
+    authority: &A,
+) {
+    let authority_id = crate::authority::Authority::host_authority_id(authority);
+    for grant in grants {
+        if grant.authority == authority_id && grant.workspace_root.as_path() == workspace_root {
+            crate::authority::Authority::grant_lsp_execution(authority, &grant.config_digest);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +349,7 @@ pub struct AppSnapshot {
     pub journal_lagging: bool,
     pub workspace_root: String,
     pub workspace_name: String,
+    pub diagnostics: Vec<ProblemDiagnostic>,
 }
 
 pub struct App {
@@ -181,11 +379,42 @@ pub struct App {
     workspace_name: String,
     terminal: Option<crate::pty::PtySession>,
     ssh_authorities: std::collections::HashMap<String, Arc<crate::authority::ssh::SshAuthority>>,
+    lsp_grants: Vec<crate::persistence::state::LspGrantRecord>,
+    language_service_states:
+        std::collections::HashMap<crate::lsp::SupervisorKey, crate::lsp::LanguageServiceState>,
+    lsp_supervisor: crate::lsp::LspSupervisor,
+    lsp_event_rx: tokio::sync::mpsc::Receiver<crate::lsp::SupervisorEvent>,
+    language_diagnostic_counts: std::collections::HashMap<crate::lsp::SupervisorKey, usize>,
+    language_servers: Vec<crate::config::LanguageServerConfig>,
+    local_authority: Option<Arc<crate::authority::local::LocalAuthority>>,
+    lsp_sessions: std::collections::HashMap<(crate::lsp::SupervisorKey, DocumentId), LspSession>,
+    lsp_runtime_tx: tokio::sync::mpsc::Sender<LspRuntimeEvent>,
+    lsp_runtime_rx: tokio::sync::mpsc::Receiver<LspRuntimeEvent>,
+    diagnostics: std::collections::HashMap<
+        (crate::lsp::SupervisorKey, DocumentId),
+        Vec<ProblemDiagnostic>,
+    >,
     terminal_starting: bool,
     terminal_launch_id: u64,
     terminal_capture: bool,
     submitted_ssh_passphrase: Option<(String, Zeroizing<Vec<u8>>)>,
+    pending_definition: Option<PendingDefinition>,
+    pending_definition_open: Option<std::path::PathBuf>,
 }
+#[derive(Clone, Debug)]
+struct CompletionCandidate {
+    label: String,
+    detail: Option<String>,
+    replacement: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDefinition {
+    path: std::path::PathBuf,
+    range: lsp_types::Range,
+}
+
+
 pub(crate) enum Overlay {
     None,
     TrustReview {
@@ -205,11 +434,475 @@ pub(crate) enum Overlay {
         invoker: Landmark,
         doc_id: DocumentId,
     },
+    RenameInput {
+        document_id: DocumentId,
+        key: crate::lsp::SupervisorKey,
+        context: hermito_protocol::lsp::LspContext,
+        position: lsp_types::Position,
+        preparation: crate::lsp::RenamePreparation,
+        new_name: String,
+        invoker: Landmark,
+    },
     SshPassphrase {
         authority_label: String,
         passphrase: Zeroizing<String>,
         invoker: Landmark,
     },
+    Completion {
+        document_id: DocumentId,
+        revision: DocumentRevision,
+        position: lsp_types::Position,
+        candidates: Vec<CompletionCandidate>,
+        selected: usize,
+        invoker: Landmark,
+    },
+    Hover {
+        document: String,
+        invoker: Landmark,
+    },
+}
+
+fn document_uri(buffer: &Buffer, document_id: DocumentId) -> String {
+    buffer
+        .path()
+        .and_then(|path| url::Url::from_file_path(path).ok())
+        .map(|url| url.into())
+        .unwrap_or_else(|| format!("untitled:{document_id:?}"))
+}
+
+struct WorkspaceEditTarget {
+    uri: String,
+    relative_path: std::path::PathBuf,
+    buffer_index: Option<usize>,
+}
+
+fn workspace_edit_target_path(
+    uri: &str,
+    root: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), crate::lsp::ProviderError> {
+    let path = url::Url::parse(uri)
+        .ok()
+        .and_then(|url| url.to_file_path().ok())
+        .ok_or_else(|| crate::lsp::ProviderError::UnresolvableWorkspaceDocument {
+            uri: uri.to_owned(),
+        })?;
+    let relative_path = path
+        .strip_prefix(root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|path| {
+            path.components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| crate::lsp::ProviderError::UnresolvableWorkspaceDocument {
+            uri: uri.to_owned(),
+        })?;
+    Ok((path, relative_path))
+}
+
+fn buffers_at_indices_mut<'a>(
+    buffers: &'a mut [Buffer],
+    indices: &[usize],
+    base_index: usize,
+) -> Option<Vec<&'a mut Buffer>> {
+    let (&index, remaining) = indices.split_first()?;
+    let offset = index.checked_sub(base_index)?;
+    let (_, from_index) = buffers.split_at_mut(offset);
+    let (buffer, after) = from_index.split_first_mut()?;
+    let mut selected = vec![buffer];
+    if !remaining.is_empty() {
+        selected.extend(buffers_at_indices_mut(after, remaining, index.checked_add(1)?)?);
+    }
+    Some(selected)
+}
+
+fn spawn_lsp_session<A: crate::authority::Authority + 'static>(
+    authority: Arc<A>,
+    key: crate::lsp::SupervisorKey,
+    document_id: DocumentId,
+    context: hermito_protocol::lsp::LspContext,
+    uri: String,
+    language_id: String,
+    text: String,
+    effective_config: crate::config::EffectiveLspConfig,
+    mut commands: tokio::sync::mpsc::Receiver<LspSessionCommand>,
+    runtime_events: tokio::sync::mpsc::Sender<LspRuntimeEvent>,
+    cancellation: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        let initialization_options = effective_config.initialization_options.clone();
+        let expected_constraint = effective_config
+            .expected_version
+            .clone()
+            .or_else(|| effective_config.expected_digest.clone())
+            .unwrap_or_default();
+        let transport = match crate::authority::Authority::start_lsp(
+            authority.as_ref(),
+            context.clone(),
+            effective_config,
+            cancellation.clone(),
+        )
+        .await
+        {
+            Ok(transport) => transport,
+            Err(error) => {
+                let message = error.to_string();
+                let state = if message.contains("LSP_VERSION_MISMATCH:") {
+                    crate::lsp::LanguageServiceState::VersionMismatch {
+                        expected: expected_constraint,
+                        actual: message,
+                    }
+                } else {
+                    crate::lsp::LanguageServiceState::Failed { message }
+                };
+                let _ = runtime_events.try_send(LspRuntimeEvent::State {
+                    key,
+                    context,
+                    state,
+                });
+                return;
+            }
+        };
+        let client = Arc::new(crate::lsp::LspClient::new(
+            AppLspTransport(transport),
+            context.authority_identity.clone(),
+            LSP_REQUEST_TIMEOUT,
+            crate::lsp::VersionlessPolicy::SafeDiscard,
+            cancellation.clone(),
+        ));
+        let receive_client = Arc::clone(&client);
+        let receive_events = runtime_events.clone();
+        let receive_key = key.clone();
+        let receive_context = context.clone();
+        let receive_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                let message = tokio::select! {
+                    _ = receive_cancellation.cancelled() => return,
+                    result = receive_client.recv() => match result {
+                        Ok(message) => message,
+                        Err(error) => {
+                            let _ = receive_events.try_send(LspRuntimeEvent::TransportLoss {
+                                key: receive_key.clone(),
+                                context: receive_context.clone(),
+                                detail: error.to_string(),
+                            });
+                            receive_cancellation.cancel();
+                            return;
+                        }
+                    }
+                };
+                if matches!(message, hermito_protocol::lsp::LspV1::Exited { .. }) {
+                    let _ = receive_events.try_send(LspRuntimeEvent::TransportLoss {
+                        key: receive_key.clone(),
+                        context: receive_context.clone(),
+                        detail: "language server session exited".into(),
+                    });
+                    receive_cancellation.cancel();
+                    return;
+                }
+                match receive_client.handle_incoming(message).await {
+                    Ok(crate::lsp::Incoming::PublishDiagnostics {
+                        context,
+                        uri,
+                        version,
+                        diagnostics,
+                    }) => {
+                        let _ = receive_events.try_send(LspRuntimeEvent::Diagnostics {
+                            key: receive_key.clone(),
+                            document_id,
+                            context,
+                            uri,
+                            version,
+                            diagnostics,
+                        });
+                    }
+                    Ok(crate::lsp::Incoming::WorkspaceEdit {
+                        context,
+                        request_id,
+                        edit,
+                    }) => {
+                        let event = LspRuntimeEvent::WorkspaceEdit {
+                            key: receive_key.clone(),
+                            document_id,
+                            context,
+                            request_id,
+                            edit,
+                            client: Arc::clone(&receive_client),
+                        };
+                        if let Err(error) = receive_events.try_send(event) {
+                            let reason = match &error {
+                                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                    "workspace edit queue is busy"
+                                }
+                                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                    "workspace edit handler is unavailable"
+                                }
+                            };
+                            let LspRuntimeEvent::WorkspaceEdit {
+                                client,
+                                context,
+                                request_id,
+                                ..
+                            } = error.into_inner()
+                            else {
+                                unreachable!("workspace edit event was just constructed");
+                            };
+                            send_workspace_edit_result(
+                                client,
+                                context,
+                                request_id,
+                                false,
+                                Some(reason),
+                            );
+                        }
+                    }
+                    Ok(_) | Err(crate::lsp::LspClientError::Stale(_)) => {}
+                    Err(error) => {
+                        let _ = receive_events.try_send(LspRuntimeEvent::TransportLoss {
+                            key: receive_key.clone(),
+                            context: receive_context.clone(),
+                            detail: error.to_string(),
+                        });
+                        receive_cancellation.cancel();
+                        return;
+                    }
+                }
+            }
+        });
+        if let Err(error) = client
+            .initialize(
+                context.clone(),
+                None,
+                serde_json::json!({}),
+                initialization_options,
+            )
+            .await
+        {
+            let _ = runtime_events.try_send(LspRuntimeEvent::State {
+                key,
+                context: context.clone(),
+                state: crate::lsp::LanguageServiceState::Failed {
+                    message: error.to_string(),
+                },
+            });
+            cancellation.cancel();
+            return;
+        }
+        if let Err(error) = client
+            .did_open(
+                context.clone(),
+                &uri,
+                &language_id,
+                context.sent_version.0 as i32,
+                &text,
+            )
+            .await
+        {
+            let _ = runtime_events.try_send(LspRuntimeEvent::State {
+                key,
+                context: context.clone(),
+                state: crate::lsp::LanguageServiceState::Failed {
+                    message: error.to_string(),
+                },
+            });
+            cancellation.cancel();
+            return;
+        }
+        let _ = runtime_events.try_send(LspRuntimeEvent::Initialized {
+            key: key.clone(),
+            context: context.clone(),
+        });
+        while let Some(command) = commands.recv().await {
+            match command {
+                LspSessionCommand::Change(change) => {
+                    let context = change.context.clone();
+                    if let Err(error) = client
+                        .did_change(change.context, &change.uri, change.version, &change.text)
+                        .await
+                    {
+                        let _ = runtime_events.try_send(LspRuntimeEvent::State {
+                            key: key.clone(),
+                            context,
+                            state: crate::lsp::LanguageServiceState::Failed {
+                                message: error.to_string(),
+                            },
+                        });
+                        cancellation.cancel();
+                        return;
+                    }
+                }
+                LspSessionCommand::Provider {
+                    kind,
+                    snapshot,
+                    position,
+                } => {
+                    let result = {
+                        let request = crate::lsp::requests::ProviderSnapshotRequest {
+                            authority: authority.as_ref(),
+                            service: &key,
+                            service_state: Some(snapshot.service_state.clone()),
+                            config_digest: &snapshot.config_digest,
+                            context: snapshot.context.clone(),
+                            uri: &snapshot.uri,
+                            revision: snapshot.revision,
+                            ledger: &snapshot.ledger,
+                        };
+                        match kind {
+                            LspProviderKind::Completion => {
+                                crate::lsp::CompletionProvider::complete_snapshot(
+                                    client.as_ref(),
+                                    &request,
+                                    position,
+                                )
+                                .await
+                                .map(LspProviderResult::ReadOnly)
+                            }
+                            LspProviderKind::Hover => crate::lsp::HoverProvider::hover_snapshot(
+                                client.as_ref(),
+                                &request,
+                                position,
+                            )
+                            .await
+                            .map(LspProviderResult::ReadOnly),
+                            LspProviderKind::Definition => {
+                                crate::lsp::DefinitionProvider::definition_snapshot(
+                                    client.as_ref(),
+                                    &request,
+                                    position,
+                                )
+                                .await
+                                .map(LspProviderResult::ReadOnly)
+                            }
+                            LspProviderKind::RenamePreparation => {
+                                crate::lsp::RenameProvider::prepare_snapshot(
+                                    client.as_ref(),
+                                    &request,
+                                    position,
+                                )
+                                .await
+                                .map(LspProviderResult::RenamePrepared)
+                            }
+                            LspProviderKind::Rename => unreachable!("rename has its own command"),
+                        }
+                        .map_err(|error| error.to_string())
+                    };
+                    let _ = runtime_events.try_send(LspRuntimeEvent::ProviderResult {
+                        key: key.clone(),
+                        document_id,
+                        context: snapshot.context,
+                        revision: snapshot.revision,
+                        position,
+                        kind,
+                        result,
+                    });
+                }
+                LspSessionCommand::Rename {
+                    snapshot,
+                    preparation,
+                    position,
+                    new_name,
+                } => {
+                    let request = crate::lsp::requests::ProviderSnapshotRequest {
+                        authority: authority.as_ref(),
+                        service: &key,
+                        service_state: Some(snapshot.service_state.clone()),
+                        config_digest: &snapshot.config_digest,
+                        context: snapshot.context.clone(),
+                        uri: &snapshot.uri,
+                        revision: snapshot.revision,
+                        ledger: &snapshot.ledger,
+                    };
+                    let result = crate::lsp::RenameProvider::request_rename_snapshot(
+                        client.as_ref(),
+                        &request,
+                        &preparation,
+                        position,
+                        &new_name,
+                    )
+                    .await
+                    .map(LspProviderResult::RenameWorkspaceEdit)
+                    .map_err(|error| error.to_string());
+                    let _ = runtime_events.try_send(LspRuntimeEvent::ProviderResult {
+                        key: key.clone(),
+                        document_id,
+                        context: snapshot.context,
+                        revision: snapshot.revision,
+                        position,
+                        kind: LspProviderKind::Rename,
+                        result,
+                    });
+                }
+            }
+        }
+        cancellation.cancel();
+    });
+}
+
+fn completion_candidates(payload: &serde_json::Value) -> Vec<CompletionCandidate> {
+    let items = payload
+        .as_array()
+        .or_else(|| payload.get("items").and_then(serde_json::Value::as_array))
+        .into_iter()
+        .flatten();
+    items
+        .filter_map(|item| {
+            let label = item.get("label")?.as_str()?.to_owned();
+            Some(CompletionCandidate {
+                replacement: item
+                    .get("insertText")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&label)
+                    .to_owned(),
+                detail: item
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                label,
+            })
+        })
+        .collect()
+}
+
+fn hover_document(payload: &serde_json::Value) -> Option<String> {
+    let contents = payload.get("contents")?;
+    match contents {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(hover_document_part)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => hover_document_part(contents),
+    }
+}
+
+fn hover_document_part(part: &serde_json::Value) -> Option<String> {
+    part.as_str()
+        .map(str::to_owned)
+        .or_else(|| part.get("value")?.as_str().map(str::to_owned))
+}
+
+fn definition_target(payload: &serde_json::Value) -> Option<(url::Url, lsp_types::Range)> {
+    let target = payload
+        .as_array()
+        .and_then(|locations| locations.first())
+        .unwrap_or(payload);
+    let uri = target
+        .get("uri")
+        .or_else(|| target.get("targetUri"))?
+        .as_str()?
+        .parse()
+        .ok()?;
+    let range = target
+        .get("range")
+        .or_else(|| target.get("targetSelectionRange"))
+        .or_else(|| target.get("targetRange"))?;
+    serde_json::from_value(range.clone()).ok().map(|range| (uri, range))
 }
 
 fn command_palette_items(trust: TrustLevel, query: &str) -> Vec<String> {
@@ -260,6 +953,10 @@ impl App {
         if let Some(id) = current_doc {
             layout.open_or_focus_editor(id);
         }
+        let (lsp_supervisor, lsp_event_rx) =
+            crate::lsp::LspSupervisor::channel(LSP_SUPERVISOR_EVENT_CHANNEL_CAPACITY);
+        let (lsp_runtime_tx, lsp_runtime_rx) =
+            tokio::sync::mpsc::channel(LSP_RUNTIME_EVENT_CHANNEL_CAPACITY);
         App {
             epoch,
             layout,
@@ -290,10 +987,23 @@ impl App {
             workspace_name: "workspace".into(),
             terminal: None,
             ssh_authorities: std::collections::HashMap::new(),
+            lsp_grants: vec![],
+            language_service_states: std::collections::HashMap::new(),
+            language_diagnostic_counts: std::collections::HashMap::new(),
+            language_servers: Vec::new(),
+            local_authority: None,
+            lsp_sessions: std::collections::HashMap::new(),
+            lsp_runtime_tx,
+            lsp_runtime_rx,
+            diagnostics: std::collections::HashMap::new(),
             terminal_starting: false,
             terminal_launch_id: 0,
             terminal_capture: false,
+            lsp_supervisor,
+            lsp_event_rx,
             submitted_ssh_passphrase: None,
+            pending_definition: None,
+            pending_definition_open: None,
         }
     }
 
@@ -341,6 +1051,11 @@ impl App {
                         );
                     }
                     self.focus = Landmark::Authority;
+                    // Dropping command senders cancels sessions routed through
+                    // the previously selected authority before a new exact
+                    // authority/document association is started.
+                    self.lsp_sessions.clear();
+                    self.start_language_service_for_current_document();
                 }
             }
             Action::NextControl => {
@@ -352,6 +1067,13 @@ impl App {
                 {
                     if !items.is_empty() {
                         *selected = (*selected + 1) % items.len();
+                    }
+                } else if let Overlay::Completion {
+                    selected, candidates, ..
+                } = &mut self.overlay
+                {
+                    if !candidates.is_empty() {
+                        *selected = (*selected + 1) % candidates.len();
                     }
                 }
             }
@@ -365,6 +1087,17 @@ impl App {
                     if !items.is_empty() {
                         *selected = if *selected == 0 {
                             items.len() - 1
+                        } else {
+                            *selected - 1
+                        };
+                    }
+                } else if let Overlay::Completion {
+                    selected, candidates, ..
+                } = &mut self.overlay
+                {
+                    if !candidates.is_empty() {
+                        *selected = if *selected == 0 {
+                            candidates.len() - 1
                         } else {
                             *selected - 1
                         };
@@ -386,6 +1119,46 @@ impl App {
                         }
                         return;
                     }
+                }
+                let completion = match &self.overlay {
+                    Overlay::Completion {
+                        document_id,
+                        revision,
+                        position,
+                        candidates,
+                        selected,
+                        ..
+                    } => candidates.get(*selected).cloned().map(|candidate| {
+                        (*document_id, *revision, *position, candidate)
+                    }),
+                    _ => None,
+                };
+                if let Some((document_id, revision, position, candidate)) = completion {
+                    let insertion = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| buffer.id() == document_id && buffer.revision() == revision)
+                        .and_then(|buffer| {
+                            crate::lsp::CoordinateMapper::new(buffer.rope())
+                                .lsp_position_to_byte(position)
+                        });
+                    if self.current_doc == Some(document_id) {
+                        if let Some(byte) = insertion {
+                            self.overlay = Overlay::None;
+                            self.apply_action(Action::ApplyBufferEdit {
+                                doc_id: document_id,
+                                expected_rev: revision,
+                                edit: crate::edit::TextEdit::insert(byte, candidate.replacement.clone()),
+                            });
+                            self.layout.set_editor_cursor(byte + candidate.replacement.len());
+                            self.queue_current_lsp_change();
+                            self.status_message = format!("Completion inserted: {}.", candidate.label);
+                            return;
+                        }
+                    }
+                    self.overlay = Overlay::None;
+                    self.status_message = "Completion discarded because its editor context changed.".into();
+                    return;
                 }
                 self.overlay = Overlay::None;
             }
@@ -578,6 +1351,61 @@ impl App {
                     if let Some(authority) = self.current_ssh_authority() {
                         crate::authority::Authority::grant_execution(authority.as_ref());
                     }
+                    let selected_config = self.current_doc.and_then(|document_id| {
+                        self.buffers
+                            .iter()
+                            .find(|buffer| buffer.id() == document_id)
+                            .and_then(|buffer| {
+                                crate::config::resolve_language_server(
+                                    &self.language_servers,
+                                    buffer.language().as_str(),
+                                    buffer.path().map(std::path::Path::new),
+                                    &hermito_protocol::request::ExecutionContextV1::AuthorityRoot,
+                                )
+                            })
+                    });
+                    if let Some(config) = selected_config {
+                        let workspace_root = std::path::PathBuf::from(&self.workspace_root);
+                        let authority_id = match self
+                            .authorities
+                            .get(self.current_authority)
+                            .map(|authority| authority.kind)
+                        {
+                            Some(AuthorityKind::Local) => self.local_authority.as_ref().map(
+                                |authority| {
+                                    crate::authority::Authority::grant_lsp_execution(
+                                        authority.as_ref(),
+                                        &config.digest,
+                                    );
+                                    crate::authority::Authority::host_authority_id(authority.as_ref())
+                                },
+                            ),
+                            Some(AuthorityKind::Ssh) => self
+                                .current_ssh_authority()
+                                .map(|authority| {
+                                    crate::authority::Authority::grant_lsp_execution(
+                                        authority.as_ref(),
+                                        &config.digest,
+                                    );
+                                    crate::authority::Authority::host_authority_id(authority.as_ref())
+                                }),
+                            _ => None,
+                        };
+                        if let Some(authority) = authority_id {
+                            if !self.lsp_grants.iter().any(|grant| {
+                                grant.workspace_root == workspace_root
+                                    && grant.authority == authority
+                                    && grant.config_digest == config.digest
+                            }) {
+                                self.lsp_grants.push(crate::persistence::state::LspGrantRecord {
+                                    workspace_root,
+                                    authority,
+                                    config_digest: config.digest,
+                                });
+                            }
+                        }
+                    }
+                    self.start_language_service_for_current_document();
                     self.focus = invoker;
                     self.overlay = Overlay::None;
                     self.status_message = "Execution granted for current authority.".into();
@@ -588,7 +1416,10 @@ impl App {
                     Overlay::TrustReview { invoker, .. }
                     | Overlay::CommandPalette { invoker, .. }
                     | Overlay::SaveAs { invoker, .. }
-                    | Overlay::SshPassphrase { invoker, .. } => Some(*invoker),
+                    | Overlay::SshPassphrase { invoker, .. }
+                    | Overlay::RenameInput { invoker, .. }
+                    | Overlay::Completion { invoker, .. }
+                    | Overlay::Hover { invoker, .. } => Some(*invoker),
                     Overlay::None => None,
                 };
                 if let Some(authority) = self.authorities.get_mut(self.current_authority) {
@@ -616,7 +1447,9 @@ impl App {
                 if let Overlay::TrustReview { invoker, .. }
                 | Overlay::CommandPalette { invoker, .. }
                 | Overlay::SaveAs { invoker, .. }
-                | Overlay::SshPassphrase { invoker, .. } = &self.overlay
+                | Overlay::SshPassphrase { invoker, .. }
+                | Overlay::Completion { invoker, .. }
+                | Overlay::Hover { invoker, .. } = &self.overlay
                 {
                     self.focus = *invoker;
                 }
@@ -800,6 +1633,28 @@ impl App {
                         self.focus = Landmark::Editor;
                         self.status_message = format!("Opened {}", path.to_string_lossy());
                     }
+                    if self
+                        .pending_definition
+                        .as_ref()
+                        .is_some_and(|target| target.path == path)
+                    {
+                        if let Some(target) = self.pending_definition.take() {
+                            if let Some((start, end)) = self
+                                .current_doc
+                                .and_then(|id| self.buffers.iter().find(|buffer| buffer.id() == id))
+                                .and_then(|buffer| {
+                                    let mapper = crate::lsp::CoordinateMapper::new(buffer.rope());
+                                    Some((
+                                        mapper.lsp_position_to_byte(target.range.start)?,
+                                        mapper.lsp_position_to_byte(target.range.end)?,
+                                    ))
+                                })
+                            {
+                                self.layout.set_editor_selection(start, end);
+                                self.status_message = "Definition opened.".into();
+                            }
+                        }
+                    }
                 } else {
                     self.status_message = format!("Failed to open {}", path.to_string_lossy());
                 }
@@ -839,6 +1694,100 @@ impl App {
                     self.focus = *invoker;
                 }
                 self.overlay = Overlay::None;
+            }
+            Action::RenameOverlayInput(c) => {
+                if let Overlay::RenameInput { new_name, .. } = &mut self.overlay {
+                    new_name.push(c);
+                }
+            }
+            Action::RenameOverlayBackspace => {
+                if let Overlay::RenameInput { new_name, .. } = &mut self.overlay {
+                    new_name.pop();
+                }
+            }
+            Action::RenameOverlayConfirm => {
+                let Overlay::RenameInput {
+                    document_id,
+                    key,
+                    context,
+                    position,
+                    preparation,
+                    new_name,
+                    invoker,
+                } = &self.overlay
+                else {
+                    return;
+                };
+                if new_name.trim().is_empty() {
+                    self.status_message = "Rename requires a non-empty name.".into();
+                    return;
+                }
+                let Some(session) = self.lsp_sessions.get(&(key.clone(), *document_id)) else {
+                    self.status_message = "Language service is unavailable for rename.".into();
+                    return;
+                };
+                let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id() == *document_id) else {
+                    self.status_message = "Rename requires the selected buffer.".into();
+                    return;
+                };
+                let Some(ledger) = buffer
+                    .lsp_ledger(&key.authority_identity, &key.execution_context)
+                    .cloned()
+                else {
+                    self.status_message = "Rename discarded because its document snapshot is stale.".into();
+                    return;
+                };
+                if ledger.revision != buffer.revision() || *context != (hermito_protocol::lsp::LspContext {
+                    workspace_epoch: hermito_protocol::WorkspaceEpoch(ledger.workspace_epoch.0),
+                    environment_epoch: ledger.environment_epoch,
+                    document_revision: Some(hermito_protocol::DocumentRevision(ledger.revision.0)),
+                    sent_version: hermito_protocol::lsp::SentVersion(ledger.sent_version as u64),
+                    session_generation: hermito_protocol::lsp::SessionGeneration(ledger.session_generation),
+                    execution_context: ledger.context.clone(),
+                    authority_identity: ledger.authority_identity.clone(),
+                }) {
+                    self.status_message = "Rename discarded because its document snapshot is stale.".into();
+                    return;
+                }
+                let snapshot = LspProviderSnapshot {
+                    context: context.clone(),
+                    uri: document_uri(buffer, *document_id),
+                    revision: ledger.revision,
+                    ledger,
+                    config_digest: session.config_digest.clone(),
+                    service_state: self
+                        .language_service_states
+                        .get(key)
+                        .cloned()
+                        .unwrap_or(crate::lsp::LanguageServiceState::Failed {
+                            message: "language service state unavailable".into(),
+                        }),
+                };
+                match session.command_tx.try_send(LspSessionCommand::Rename {
+                    snapshot,
+                    preparation: preparation.clone(),
+                    position: *position,
+                    new_name: new_name.clone(),
+                }) {
+                    Ok(()) => {
+                        self.focus = *invoker;
+                        self.overlay = Overlay::None;
+                        self.status_message = "Renaming…".into();
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        self.status_message = "Language request queue is busy.".into();
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        self.status_message = "Language service is unavailable for rename.".into();
+                    }
+                }
+            }
+            Action::RenameOverlayCancel => {
+                if let Overlay::RenameInput { invoker, .. } = &self.overlay {
+                    self.focus = *invoker;
+                }
+                self.overlay = Overlay::None;
+                self.status_message = "Rename cancelled.".into();
             }
             Action::SaveAsOverlayCancel => {
                 if let Overlay::SaveAs { invoker, .. } = &self.overlay {
@@ -1060,7 +2009,263 @@ impl App {
                     }
                 }
             }
+            Action::RequestCompletion => self.enqueue_current_lsp_provider(LspProviderKind::Completion),
+            Action::RequestHover => self.enqueue_current_lsp_provider(LspProviderKind::Hover),
+            Action::RequestDefinition => {
+                self.enqueue_current_lsp_provider(LspProviderKind::Definition)
+            }
+            Action::RequestRename => {
+                self.enqueue_current_lsp_provider(LspProviderKind::RenamePreparation)
+            }
         }
+    }
+    fn enqueue_current_lsp_provider(&mut self, kind: LspProviderKind) {
+        let Some(document_id) = self.current_doc else {
+            self.status_message = "Language request requires an open document.".into();
+            return;
+        };
+        let Some((key, command_tx, config_digest)) = self
+            .lsp_sessions
+            .iter()
+            .find(|((key, id), _)| *id == document_id && self.is_current_language_service_context(key))
+            .map(|((key, _), session)| {
+                (
+                    key.clone(),
+                    session.command_tx.clone(),
+                    session.config_digest.clone(),
+                )
+            })
+        else {
+            self.status_message = "Language service is unavailable for the selected document.".into();
+            return;
+        };
+        let Some(state) = self.language_service_states.get(&key).cloned() else {
+            self.status_message = "Language service is not ready for requests.".into();
+            return;
+        };
+        if !matches!(state, crate::lsp::LanguageServiceState::Ready) {
+            self.status_message = "Language service is not ready for requests.".into();
+            return;
+        }
+        let cursor = self
+            .layout
+
+            .current_editor()
+            .map(|editor| editor.cursor_byte)
+            .unwrap_or(0);
+        let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id() == document_id) else {
+            self.status_message = "Language request requires the selected buffer.".into();
+            return;
+        };
+        let Some(ledger) = buffer
+            .lsp_ledger(&key.authority_identity, &key.execution_context)
+            .cloned()
+        else {
+            self.status_message = "Language request has no current document ledger.".into();
+            return;
+        };
+        if ledger.revision != buffer.revision() {
+            self.status_message = "Language request discarded because its document snapshot is stale.".into();
+            return;
+        }
+        let Some(position) = crate::lsp::CoordinateMapper::new(buffer.rope()).byte_to_lsp_position(cursor)
+        else {
+            self.status_message = "Language request cursor is not a valid text position.".into();
+            return;
+        };
+        let snapshot = LspProviderSnapshot {
+            context: hermito_protocol::lsp::LspContext {
+                workspace_epoch: hermito_protocol::WorkspaceEpoch(ledger.workspace_epoch.0),
+                environment_epoch: ledger.environment_epoch,
+                document_revision: Some(hermito_protocol::DocumentRevision(ledger.revision.0)),
+                sent_version: hermito_protocol::lsp::SentVersion(ledger.sent_version as u64),
+                session_generation: hermito_protocol::lsp::SessionGeneration(ledger.session_generation),
+                execution_context: ledger.context.clone(),
+                authority_identity: ledger.authority_identity.clone(),
+            },
+            uri: document_uri(buffer, document_id),
+            revision: ledger.revision,
+            ledger,
+            config_digest,
+            service_state: state,
+        };
+        match command_tx.try_send(LspSessionCommand::Provider {
+            kind,
+            snapshot,
+            position,
+        }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.status_message = "Language request queue is busy.".into();
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.status_message = "Language service is unavailable for the selected document.".into();
+            }
+        }
+    }
+
+    fn apply_rename_workspace_edit<A: crate::authority::Authority + ?Sized>(
+        &mut self,
+        authority: &A,
+        key: &crate::lsp::SupervisorKey,
+        document_id: DocumentId,
+        context: hermito_protocol::lsp::LspContext,
+        workspace_edit: &hermito_protocol::lsp::TransactionalWorkspaceEdit,
+    ) -> Result<crate::lsp::RenameApplyOutcome, crate::lsp::ProviderError> {
+        let config_digest = self
+            .lsp_sessions
+            .get(&(key.clone(), document_id))
+            .ok_or(crate::lsp::ProviderError::MissingLedger)?
+            .config_digest
+            .clone();
+        let document_index = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.id() == document_id)
+            .ok_or_else(|| crate::lsp::ProviderError::MissingWorkspaceDocument {
+                uri: format!("document:{document_id:?}"),
+            })?;
+        let source_uri = document_uri(&self.buffers[document_index], document_id);
+        let (_, source_relative_path) = workspace_edit_target_path(&source_uri, authority.root())
+            .map_err(|_| crate::lsp::ProviderError::MissingWorkspaceDocument {
+                uri: source_uri.clone(),
+            })?;
+
+        let mut seen_uris = HashSet::with_capacity(workspace_edit.document_changes.len());
+        let mut targets = Vec::with_capacity(workspace_edit.document_changes.len());
+        let mut request_uri = source_uri.clone();
+        let mut source_is_target = false;
+        for edit in &workspace_edit.document_changes {
+            let hermito_protocol::lsp::TransactionalDocumentEdit::TextDocument { uri, .. } = edit;
+            if !seen_uris.insert(uri.as_str()) {
+                continue;
+            }
+            let (path, relative_path) = workspace_edit_target_path(uri, authority.root())?;
+            let buffer_index = self
+                .buffers
+                .iter()
+                .position(|buffer| buffer.path() == Some(path.as_path()));
+            if buffer_index == Some(document_index) {
+                if source_is_target {
+                    return Err(crate::lsp::ProviderError::DuplicateWorkspaceDocument {
+                        uri: uri.clone(),
+                    });
+                }
+                source_is_target = true;
+                request_uri = uri.clone();
+            }
+            targets.push(WorkspaceEditTarget {
+                uri: uri.clone(),
+                relative_path,
+                buffer_index,
+            });
+        }
+
+        for target in targets
+            .iter_mut()
+            .filter(|target| target.buffer_index.is_none())
+        {
+            let request = crate::authority::types::AuthorityRequest::new(
+                crate::authority::types::ReadFileRequest {
+                    path: target.relative_path.clone(),
+                    max_bytes: hermito_protocol::fs::MAX_WIRE_FILE_BYTES as usize,
+                },
+                context.workspace_epoch,
+                context.environment_epoch,
+                context.document_revision,
+            );
+            let bytes = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(authority.read_file(request))
+            })
+            .map_err(|_| crate::lsp::ProviderError::UnresolvableWorkspaceDocument {
+                uri: target.uri.clone(),
+            })?
+            .payload;
+            let content = std::str::from_utf8(&bytes).map_err(|_| {
+                crate::lsp::ProviderError::UnresolvableWorkspaceDocument {
+                    uri: target.uri.clone(),
+                }
+            })?;
+            let path = authority.root().join(&target.relative_path);
+            let mut buffer = Buffer::restore_clean(
+                DocumentId::new(),
+                Language::from_path(&path),
+                content,
+                DocumentRevision(0),
+                BufferPathState::Saved(path),
+            );
+            buffer.ensure_lsp_ledger(
+                context.authority_identity.clone(),
+                context.execution_context.clone(),
+                WorkspaceEpoch(context.workspace_epoch.0),
+                context.environment_epoch,
+            );
+            target.buffer_index = Some(self.buffers.len());
+            self.buffers.push(buffer);
+        }
+
+        let mut selected_indices = targets
+            .iter()
+            .filter_map(|target| target.buffer_index)
+            .collect::<Vec<_>>();
+        selected_indices.push(document_index);
+        selected_indices.sort_unstable();
+        selected_indices.dedup();
+        let source_position = selected_indices
+            .binary_search(&document_index)
+            .map_err(|_| crate::lsp::ProviderError::MissingLedger)?;
+        let selected_buffers = buffers_at_indices_mut(&mut self.buffers, &selected_indices, 0)
+            .ok_or(crate::lsp::ProviderError::MissingLedger)?;
+        let mut selected = selected_indices
+            .into_iter()
+            .zip(selected_buffers)
+            .collect::<Vec<_>>();
+        let (_, source_buffer) = selected.remove(source_position);
+        let mut documents = Vec::with_capacity(targets.len().saturating_sub(source_is_target as usize));
+        for target in &targets {
+            let Some(buffer_index) = target.buffer_index else {
+                return Err(crate::lsp::ProviderError::MissingWorkspaceDocument {
+                    uri: target.uri.clone(),
+                });
+            };
+            if buffer_index == document_index {
+                continue;
+            }
+            let position = selected
+                .iter()
+                .position(|(index, _)| *index == buffer_index)
+                .ok_or_else(|| crate::lsp::ProviderError::MissingWorkspaceDocument {
+                    uri: target.uri.clone(),
+                })?;
+            let (_, buffer) = selected.remove(position);
+            documents.push(crate::lsp::ProviderDocument {
+                uri: &target.uri,
+                relative_path: &target.relative_path,
+                buffer,
+            });
+        }
+
+        let mut request = crate::lsp::ProviderRequest {
+            authority,
+            supervisor: &self.lsp_supervisor,
+            service: key,
+            config_digest: &config_digest,
+            context,
+            document: crate::lsp::ProviderDocument {
+                uri: &request_uri,
+                relative_path: &source_relative_path,
+                buffer: source_buffer,
+            },
+        };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                crate::lsp::RenameProvider::apply_workspace_edit(
+                    &mut request,
+                    workspace_edit,
+                    &mut documents,
+                ),
+            )
+        })
     }
 
     pub fn journal_handle_mut(&mut self) -> Option<&mut JournalHandle> {
@@ -1157,6 +2362,950 @@ impl App {
             }
         }
     }
+    /// Project a supervisor state transition without creating or driving a
+    /// language-service process from the app layer.
+    pub fn record_language_service_state(
+        &mut self,
+        key: crate::lsp::SupervisorKey,
+        state: crate::lsp::LanguageServiceState,
+    ) {
+        self.language_service_states.insert(key, state);
+    }
+
+    /// Store a validated per-service diagnostic count. The protocol's
+    /// aggregate diagnostic bound keeps malformed or stale event values from
+    /// inflating the status bar.
+    pub fn record_language_diagnostic_count(
+        &mut self,
+        key: crate::lsp::SupervisorKey,
+        count: usize,
+    ) {
+        self.language_diagnostic_counts
+            .insert(key, count.min(crate::lsp::MAX_DIAGNOSTICS));
+    }
+
+    /// Explicit event-loop entry point for bounded supervisor events.
+    pub fn apply_language_service_event(&mut self, event: crate::lsp::SupervisorEvent) {
+        let key = match &event {
+            crate::lsp::SupervisorEvent::StateChanged { key, .. }
+            | crate::lsp::SupervisorEvent::DiagnosticsCountChanged { key, .. } => key,
+        };
+        if !self.is_current_language_service_context(key) {
+            return;
+        }
+        match event {
+            crate::lsp::SupervisorEvent::StateChanged { key, state } => {
+                self.record_language_service_state(key, state);
+            }
+            crate::lsp::SupervisorEvent::DiagnosticsCountChanged { key, count } => {
+                self.record_language_diagnostic_count(key, count);
+            }
+        }
+    }
+
+    fn is_current_language_service_context(&self, key: &crate::lsp::SupervisorKey) -> bool {
+        if key.workspace_epoch.0 != self.epoch.0 {
+            return false;
+        }
+        let Some(authority) = self.authorities.get(self.current_authority) else {
+            return false;
+        };
+        match authority.kind {
+            AuthorityKind::Local => {
+                key.authority_identity.0 == "local"
+                    && key.environment_epoch == hermito_protocol::EnvironmentEpoch(0)
+            }
+            AuthorityKind::Ssh => self.ssh_authorities.get(&authority.label).is_some_and(
+                |ssh_authority| {
+                    key.authority_identity.0
+                        == crate::authority::Authority::host_authority_id(ssh_authority.as_ref())
+                        && key.environment_epoch
+                            == crate::authority::Authority::environment_epoch(
+                                ssh_authority.as_ref(),
+                            )
+                },
+            ),
+            AuthorityKind::DevContainer => false,
+        }
+    }
+
+    /// Own the service lifecycle source while its bounded receiver remains on
+    /// the UI loop. Callers must report transitions through this supervisor.
+    pub fn language_service_supervisor(&mut self) -> &mut crate::lsp::LspSupervisor {
+        &mut self.lsp_supervisor
+    }
+
+    /// Poll the bounded supervisor receiver. The event loop applies returned
+    /// updates through `apply_language_service_event` on the UI thread.
+    pub(crate) fn try_recv_language_service_event(
+        &mut self,
+    ) -> Result<crate::lsp::SupervisorEvent, tokio::sync::mpsc::error::TryRecvError> {
+        self.lsp_event_rx.try_recv()
+    }
+
+    /// Install user-owned server configuration and establish the host authority
+    /// used for exact-digest LSP authorization. This performs no probe or spawn.
+    pub(crate) fn configure_language_servers(
+        &mut self,
+        language_servers: Vec<crate::config::LanguageServerConfig>,
+    ) {
+        self.language_servers = language_servers;
+        if self.local_authority.is_none() {
+            match crate::authority::local::LocalAuthority::new(
+                "host",
+                std::path::PathBuf::from(&self.workspace_root),
+                hermito_protocol::WorkspaceEpoch(self.epoch.0),
+            ) {
+                Ok(authority) => {
+                    let authority = Arc::new(authority);
+                    if self
+                        .authorities
+                        .first()
+                        .is_some_and(|state| state.trust == TrustLevel::Trusted)
+                    {
+                        crate::authority::Authority::grant_execution(authority.as_ref());
+                    }
+                    apply_persisted_lsp_grants(
+                        &self.lsp_grants,
+                        std::path::Path::new(&self.workspace_root),
+                        authority.as_ref(),
+                    );
+                    self.local_authority = Some(authority);
+                }
+                Err(error) => self.status_message = format!("LSP host unavailable: {error}"),
+            }
+        }
+        self.start_language_service_for_current_document();
+    }
+
+    /// Associate the active opened buffer with its configured service. Missing
+    /// configuration and inspect-only authority both stop before any probe or
+    /// process creation.
+    pub(crate) fn start_language_service_for_current_document(&mut self) {
+        let Some(document_id) = self.current_doc else {
+            return;
+        };
+        let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id() == document_id) else {
+            return;
+        };
+        if self
+            .authorities
+            .get(self.current_authority)
+            .is_some_and(|authority| {
+                authority.kind == AuthorityKind::Ssh
+                    && authority.connection != AuthorityConnectionState::Connected
+            })
+        {
+            return;
+        }
+        let execution_context = hermito_protocol::request::ExecutionContextV1::AuthorityRoot;
+        let language = buffer.language().as_str().to_owned();
+        let path = buffer.path().map(std::path::Path::new);
+        let authority_identity = match self.authorities.get(self.current_authority) {
+            Some(state) if state.kind == AuthorityKind::Ssh => self
+                .ssh_authorities
+                .get(&state.label)
+                .map(|authority| {
+                    hermito_protocol::lsp::AuthorityIdentity(
+                        crate::authority::Authority::host_authority_id(authority.as_ref()),
+                    )
+                })
+                .unwrap_or_else(|| hermito_protocol::lsp::AuthorityIdentity("ssh".into())),
+            _ => hermito_protocol::lsp::AuthorityIdentity("local".into()),
+        };
+        let environment_epoch = match self.authorities.get(self.current_authority) {
+            Some(state) if state.kind == AuthorityKind::Ssh => self
+                .ssh_authorities
+                .get(&state.label)
+                .map(|authority| crate::authority::Authority::environment_epoch(authority.as_ref()))
+                .unwrap_or(hermito_protocol::EnvironmentEpoch(0)),
+            _ => hermito_protocol::EnvironmentEpoch(0),
+        };
+        let key = crate::lsp::SupervisorKey::new(
+            hermito_protocol::WorkspaceEpoch(self.epoch.0),
+            environment_epoch,
+            authority_identity,
+            execution_context.clone(),
+            crate::lsp::LanguageId::from(buffer.language()),
+        );
+        let Some(config) = crate::config::resolve_language_server(
+            &self.language_servers,
+            &language,
+            path,
+            &execution_context,
+        ) else {
+            let _ = self.lsp_supervisor.enter_state(
+                key,
+                crate::lsp::LanguageServiceState::NotFound {
+                    detail: "LSP configuration not found for document association".into(),
+                },
+            );
+            return;
+        };
+        match self.authorities.get(self.current_authority).map(|state| state.kind) {
+            Some(AuthorityKind::Ssh) => {
+                if let Some(authority) = self
+                    .authorities
+                    .get(self.current_authority)
+                    .and_then(|state| self.ssh_authorities.get(&state.label))
+                    .cloned()
+                {
+                    self.start_lsp_session(authority, key, document_id, execution_context, config);
+                }
+            }
+            Some(AuthorityKind::Local) => {
+                if let Some(authority) = self.local_authority.clone() {
+                    self.start_lsp_session(authority, key, document_id, execution_context, config);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_lsp_session<A: crate::authority::Authority + 'static>(
+        &mut self,
+        authority: Arc<A>,
+        key: crate::lsp::SupervisorKey,
+        document_id: DocumentId,
+        execution_context: hermito_protocol::request::ExecutionContextV1,
+        config: crate::config::ResolvedLanguageServerConfig,
+    ) {
+        let Ok(state) = self
+            .lsp_supervisor
+            .inspect(authority.as_ref(), key.clone(), &config.digest)
+        else {
+            return;
+        };
+        if !matches!(state, crate::lsp::LanguageServiceState::Starting) {
+            return;
+        }
+        if !self.buffers.iter().any(|buffer| buffer.id() == document_id) {
+            return;
+        }
+        let session_key = (key.clone(), document_id);
+        if let Some(superseded) = self.lsp_sessions.remove(&session_key) {
+            superseded.cancellation.cancel();
+            if let Err(error) = self
+                .lsp_supervisor
+                .request_restart(&key, &superseded.context)
+            {
+                let _ = self.lsp_supervisor.enter_state(
+                    key,
+                    crate::lsp::LanguageServiceState::Failed {
+                        message: error.to_string(),
+                    },
+                );
+                return;
+            }
+        }
+        let Some(buffer) = self.buffers.iter_mut().find(|buffer| buffer.id() == document_id) else {
+            return;
+        };
+        let ledger = buffer.reset_lsp_session(
+            key.authority_identity.clone(),
+            execution_context,
+            WorkspaceEpoch(self.epoch.0),
+            key.environment_epoch,
+        );
+        let context = hermito_protocol::lsp::LspContext {
+            workspace_epoch: hermito_protocol::WorkspaceEpoch(self.epoch.0),
+            environment_epoch: key.environment_epoch,
+            document_revision: Some(hermito_protocol::DocumentRevision(ledger.revision.0)),
+            sent_version: hermito_protocol::lsp::SentVersion(ledger.sent_version as u64),
+            session_generation: hermito_protocol::lsp::SessionGeneration(ledger.session_generation),
+            execution_context: ledger.context.clone(),
+            authority_identity: key.authority_identity.clone(),
+        };
+        if let Err(error) = self.lsp_supervisor.activate_session(&key, &context) {
+            let _ = self.lsp_supervisor.enter_state(
+                key,
+                crate::lsp::LanguageServiceState::Failed {
+                    message: error.to_string(),
+                },
+            );
+            return;
+        }
+        let uri = document_uri(buffer, document_id);
+        let language_id = buffer.language().as_str().to_owned();
+        let (command_tx, command_rx) =
+            tokio::sync::mpsc::channel(LSP_SESSION_COMMAND_CHANNEL_CAPACITY);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.lsp_sessions.insert(
+            session_key,
+            LspSession {
+                command_tx,
+                cancellation: cancellation.clone(),
+                context: context.clone(),
+                pending_change: None,
+                config_digest: config.digest.clone(),
+            },
+        );
+        spawn_lsp_session(
+            authority,
+            key,
+            document_id,
+            context,
+            uri,
+            language_id,
+            ledger.text,
+            config.effective,
+            command_rx,
+            self.lsp_runtime_tx.clone(),
+            cancellation,
+        );
+    }
+
+    pub(crate) fn queue_current_lsp_change(&mut self) {
+        let Some(document_id) = self.current_doc else {
+            return;
+        };
+        let keys: Vec<_> = self
+            .lsp_sessions
+            .keys()
+            .filter(|(_, id)| *id == document_id)
+            .cloned()
+            .collect();
+        for (key, id) in keys {
+            let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id() == id) else {
+                continue;
+            };
+            let Some(ledger) = buffer.lsp_ledger(&key.authority_identity, &key.execution_context) else {
+                continue;
+            };
+            let change = LspChange {
+                context: hermito_protocol::lsp::LspContext {
+                    workspace_epoch: hermito_protocol::WorkspaceEpoch(ledger.workspace_epoch.0),
+                    environment_epoch: ledger.environment_epoch,
+                    document_revision: Some(hermito_protocol::DocumentRevision(ledger.revision.0)),
+                    sent_version: hermito_protocol::lsp::SentVersion(ledger.sent_version as u64),
+                    session_generation: hermito_protocol::lsp::SessionGeneration(ledger.session_generation),
+                    execution_context: ledger.context.clone(),
+                    authority_identity: ledger.authority_identity.clone(),
+                },
+                uri: document_uri(buffer, id),
+                version: ledger.sent_version,
+                text: ledger.text.clone(),
+            };
+            if let Some(session) = self.lsp_sessions.get_mut(&(key, id)) {
+                match session.command_tx.try_send(LspSessionCommand::Change(change.clone())) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        session.pending_change = Some(change);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        session.pending_change = None;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn flush_pending_lsp_changes(&mut self) {
+        for session in self.lsp_sessions.values_mut() {
+            let Some(change) = session.pending_change.clone() else {
+                continue;
+            };
+            if session
+                .command_tx
+                .try_send(LspSessionCommand::Change(change))
+                .is_ok()
+            {
+                session.pending_change = None;
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_definition_open(&mut self) -> Option<std::path::PathBuf> {
+        self.pending_definition_open.take()
+    }
+
+    pub(crate) fn try_recv_lsp_runtime_event(
+        &mut self,
+    ) -> Result<LspRuntimeEvent, tokio::sync::mpsc::error::TryRecvError> {
+        self.lsp_runtime_rx.try_recv()
+    }
+
+    pub(crate) fn apply_lsp_runtime_event(&mut self, event: LspRuntimeEvent) {
+        match event {
+            LspRuntimeEvent::State {
+                key,
+                context,
+                state,
+            } => {
+                if self.is_current_language_service_context(&key)
+                    && self.lsp_supervisor.is_current_session(&key, &context)
+                {
+                    self.record_language_service_state(key, state);
+                }
+            }
+            LspRuntimeEvent::Initialized { key, context } => {
+                if !self.is_current_language_service_context(&key)
+                    || !self.lsp_supervisor.is_current_session(&key, &context)
+                {
+                    tracing::debug!(
+                        authority_identity = %context.authority_identity.0,
+                        execution_context = ?context.execution_context,
+                        session_generation = context.session_generation.0,
+                        reason = "stale_session",
+                        "discarded stale LSP initialization"
+                    );
+                    return;
+                }
+                if let Err(error) = self.lsp_supervisor.mark_ready(&key, &context) {
+                    self.record_language_service_state(
+                        key,
+                        crate::lsp::LanguageServiceState::Failed {
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            }
+            LspRuntimeEvent::TransportLoss {
+                key,
+                context,
+                detail,
+            } => {
+                if !self.is_current_language_service_context(&key) {
+                    return;
+                }
+                match self
+                    .lsp_supervisor
+                    .observe_transport_loss(&key, &context, detail)
+                {
+                    crate::lsp::RestartDecision::Restart {
+                        session_generation,
+                        delay,
+                    } => {
+                        self.lsp_sessions.retain(|(session_key, _), _| session_key != &key);
+                        let events = self.lsp_runtime_tx.clone();
+                        tokio::spawn(async move {
+                            let cancellation = tokio_util::sync::CancellationToken::new();
+                            if crate::lsp::LspSupervisor::wait_for_restart(delay, &cancellation).await {
+                                let _ = events.try_send(LspRuntimeEvent::Restart {
+                                    key,
+                                    generation: session_generation,
+                                });
+                            }
+                        });
+                    }
+                    crate::lsp::RestartDecision::Exhausted
+                    | crate::lsp::RestartDecision::IgnoredStale => {}
+                }
+            }
+            LspRuntimeEvent::Restart { key, generation } => {
+                if self.is_current_language_service_context(&key)
+                    && self.lsp_supervisor.session_generation(&key) == Some(generation)
+                {
+                    self.start_language_service_for_current_document();
+                }
+            }
+            LspRuntimeEvent::WorkspaceEdit {
+                key,
+                document_id,
+                context,
+                request_id,
+                edit,
+                client,
+            } => {
+                if !self.is_current_language_service_context(&key)
+                    || !self.lsp_supervisor.is_current_session(&key, &context)
+                {
+                    tracing::debug!(
+                        authority_identity = %context.authority_identity.0,
+                        execution_context = ?context.execution_context,
+                        session_generation = context.session_generation.0,
+                        sent_version = context.sent_version.0,
+                        revision = ?context.document_revision,
+                        reason = "stale_session",
+                        "rejected LSP workspace edit"
+                    );
+                    send_workspace_edit_result(
+                        client,
+                        context,
+                        request_id,
+                        false,
+                        Some("workspace edit request is stale"),
+                    );
+                    return;
+                }
+                let mut rejection = None;
+                if edit.validate().is_err() {
+                    rejection = Some("workspace edit is malformed");
+                } else {
+                    match self.buffers.iter().find(|buffer| buffer.id() == document_id) {
+                        Some(buffer) => match buffer
+                            .lsp_ledger(&key.authority_identity, &key.execution_context)
+                        {
+                            Some(ledger) => {
+                                let sent = hermito_protocol::lsp::LspContext {
+                                    workspace_epoch: hermito_protocol::WorkspaceEpoch(
+                                        ledger.workspace_epoch.0,
+                                    ),
+                                    environment_epoch: ledger.environment_epoch,
+                                    document_revision: Some(
+                                        hermito_protocol::DocumentRevision(ledger.revision.0),
+                                    ),
+                                    sent_version: hermito_protocol::lsp::SentVersion(
+                                        ledger.sent_version as u64,
+                                    ),
+                                    session_generation: hermito_protocol::lsp::SessionGeneration(
+                                        ledger.session_generation,
+                                    ),
+                                    execution_context: ledger.context.clone(),
+                                    authority_identity: ledger.authority_identity.clone(),
+                                };
+                                if crate::lsp::LspClient::<AppLspTransport>::filter_stale_context(
+                                    &context,
+                                    &sent,
+                                    Some(ledger),
+                                )
+                                .is_err()
+                                {
+                                    tracing::debug!(
+                                        authority_identity = %context.authority_identity.0,
+                                        execution_context = ?context.execution_context,
+                                        session_generation = context.session_generation.0,
+                                        sent_version = context.sent_version.0,
+                                        revision = ?context.document_revision,
+                                        reason = "stale_document",
+                                        "rejected LSP workspace edit"
+                                    );
+                                    send_workspace_edit_result(
+                                        client,
+                                        context,
+                                        request_id,
+                                        false,
+                                        Some("workspace edit request is stale"),
+                                    );
+                                    return;
+                                }
+                            }
+                            None => rejection = Some("workspace edit has no current document ledger"),
+                        },
+                        None => rejection = Some("workspace edit document is unavailable"),
+                    }
+                }
+                if let Some(reason) = rejection {
+                    tracing::debug!(
+                        authority_identity = %context.authority_identity.0,
+                        execution_context = ?context.execution_context,
+                        session_generation = context.session_generation.0,
+                        sent_version = context.sent_version.0,
+                        revision = ?context.document_revision,
+                        reason,
+                        "rejected LSP workspace edit"
+                    );
+                    self.status_message = reason.into();
+                    send_workspace_edit_result(client, context, request_id, false, Some(reason));
+                    return;
+                }
+
+                let authority = self.authorities.get(self.current_authority).cloned();
+                let applied = match authority.map(|authority| authority.kind) {
+                    Some(AuthorityKind::Local) => self.local_authority.clone().map(|authority| {
+                        self.apply_rename_workspace_edit(
+                            authority.as_ref(),
+                            &key,
+                            document_id,
+                            context.clone(),
+                            &edit,
+                        )
+                    }),
+                    Some(AuthorityKind::Ssh) => self.current_ssh_authority().map(|authority| {
+                        self.apply_rename_workspace_edit(
+                            authority.as_ref(),
+                            &key,
+                            document_id,
+                            context.clone(),
+                            &edit,
+                        )
+                    }),
+                    Some(AuthorityKind::DevContainer) | None => None,
+                };
+                match applied {
+                    Some(Ok(crate::lsp::RenameApplyOutcome::Applied))
+                    | Some(Ok(crate::lsp::RenameApplyOutcome::NoChanges)) => {
+                        tracing::debug!(
+                            authority_identity = %context.authority_identity.0,
+                            execution_context = ?context.execution_context,
+                            session_generation = context.session_generation.0,
+                            sent_version = context.sent_version.0,
+                            revision = ?context.document_revision,
+                            state = "applied",
+                            "accepted LSP workspace edit"
+                        );
+                        self.status_message = "Workspace edit applied.".into();
+                        send_workspace_edit_result(client, context, request_id, true, None);
+                    }
+                    Some(Ok(crate::lsp::RenameApplyOutcome::Rejected)) => {
+                        tracing::debug!(
+                            authority_identity = %context.authority_identity.0,
+                            execution_context = ?context.execution_context,
+                            session_generation = context.session_generation.0,
+                            reason = "authority_rejected",
+                            "rejected LSP workspace edit"
+                        );
+                        self.status_message = "Workspace edit was rejected by the authority.".into();
+                        send_workspace_edit_result(
+                            client,
+                            context,
+                            request_id,
+                            false,
+                            Some("workspace edit was rejected by the authority"),
+                        );
+                    }
+                    Some(Err(_)) => {
+                        tracing::debug!(
+                            authority_identity = %context.authority_identity.0,
+                            execution_context = ?context.execution_context,
+                            session_generation = context.session_generation.0,
+                            reason = "apply_failed",
+                            "rejected LSP workspace edit"
+                        );
+                        self.status_message = "Workspace edit apply failed.".into();
+                        send_workspace_edit_result(
+                            client,
+                            context,
+                            request_id,
+                            false,
+                            Some("workspace edit apply failed"),
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            authority_identity = %context.authority_identity.0,
+                            execution_context = ?context.execution_context,
+                            session_generation = context.session_generation.0,
+                            reason = "authority_unavailable",
+                            "rejected LSP workspace edit"
+                        );
+                        self.status_message = "Workspace edit authority is unavailable.".into();
+                        send_workspace_edit_result(
+                            client,
+                            context,
+                            request_id,
+                            false,
+                            Some("workspace edit authority is unavailable"),
+                        );
+                    }
+                }
+            }
+            LspRuntimeEvent::ProviderResult {
+                key,
+                document_id,
+                context,
+                revision,
+                position,
+                kind,
+                result,
+            } => {
+                if !self.is_current_language_service_context(&key)
+                    || !self.lsp_supervisor.is_current_session(&key, &context)
+                {
+                    tracing::debug!(
+                        authority_identity = %context.authority_identity.0,
+                        execution_context = ?context.execution_context,
+                        session_generation = context.session_generation.0,
+                        sent_version = context.sent_version.0,
+                        revision = ?context.document_revision,
+                        reason = "stale_session",
+                        "discarded stale LSP provider result"
+                    );
+                    return;
+                }
+                let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id() == document_id) else {
+                    return;
+                };
+                let Some(ledger) = buffer.lsp_ledger(&key.authority_identity, &key.execution_context) else {
+                    return;
+                };
+                if buffer.revision() != revision {
+                    tracing::debug!(
+                        authority_identity = %context.authority_identity.0,
+                        execution_context = ?context.execution_context,
+                        session_generation = context.session_generation.0,
+                        sent_version = context.sent_version.0,
+                        revision = revision.0,
+                        reason = "document_revision_mismatch",
+                        "discarded stale LSP provider result"
+                    );
+                    return;
+                }
+                let sent = hermito_protocol::lsp::LspContext {
+                    workspace_epoch: hermito_protocol::WorkspaceEpoch(ledger.workspace_epoch.0),
+                    environment_epoch: ledger.environment_epoch,
+                    document_revision: Some(hermito_protocol::DocumentRevision(ledger.revision.0)),
+                    sent_version: hermito_protocol::lsp::SentVersion(ledger.sent_version as u64),
+                    session_generation: hermito_protocol::lsp::SessionGeneration(ledger.session_generation),
+                    execution_context: ledger.context.clone(),
+                    authority_identity: ledger.authority_identity.clone(),
+                };
+                if crate::lsp::LspClient::<AppLspTransport>::filter_stale_context(
+                    &context,
+                    &sent,
+                    Some(ledger),
+                )
+                .is_err()
+                {
+                    tracing::debug!(
+                        authority_identity = %context.authority_identity.0,
+                        execution_context = ?context.execution_context,
+                        session_generation = context.session_generation.0,
+                        sent_version = context.sent_version.0,
+                        revision = revision.0,
+                        reason = "context_or_ledger_mismatch",
+                        "discarded stale LSP provider result"
+                    );
+                    return;
+                }
+                let label = match kind {
+                    LspProviderKind::Completion => "Completion",
+                    LspProviderKind::Hover => "Hover",
+                    LspProviderKind::Definition => "Definition",
+                    LspProviderKind::RenamePreparation | LspProviderKind::Rename => "Rename",
+                };
+                match result {
+                    Err(error) => {
+                        self.status_message = format!("{label} request failed: {error}");
+                    }
+                    Ok(LspProviderResult::ReadOnly(crate::lsp::ProviderOutcome::Response(payload))) => {
+                        match kind {
+                            LspProviderKind::Completion => {
+                                let candidates = completion_candidates(&payload);
+                                if candidates.is_empty() {
+                                    self.status_message = "Completion returned no candidates.".into();
+                                } else {
+                                    let count = candidates.len();
+                                    self.overlay = Overlay::Completion {
+                                        document_id,
+                                        revision,
+                                        position,
+                                        candidates,
+                                        selected: 0,
+                                        invoker: self.focus,
+                                    };
+                                    self.status_message = format!("Completion: {count} candidates.");
+                                }
+                            }
+                            LspProviderKind::Hover => {
+                                if let Some(document) = hover_document(&payload) {
+                                    self.overlay = Overlay::Hover {
+                                        document,
+                                        invoker: self.focus,
+                                    };
+                                    self.status_message = "Hover details available.".into();
+                                } else {
+                                    self.status_message = "Hover returned no displayable details.".into();
+                                }
+                            }
+                            LspProviderKind::Definition => {
+                                if let Some((uri, range)) = definition_target(&payload) {
+                                    if let Some((target_id, start, end)) = self
+                                        .buffers
+                                        .iter()
+                                        .find(|candidate| document_uri(candidate, candidate.id()) == uri.as_str())
+                                        .and_then(|target| {
+                                            let mapper = crate::lsp::CoordinateMapper::new(target.rope());
+                                            Some((
+                                                target.id(),
+                                                mapper.lsp_position_to_byte(range.start)?,
+                                                mapper.lsp_position_to_byte(range.end)?,
+                                            ))
+                                        })
+                                    {
+                                        self.layout.open_or_focus_editor(target_id);
+                                        self.current_doc = Some(target_id);
+                                        self.layout.set_editor_selection(start, end);
+                                        self.focus = Landmark::Editor;
+                                        self.status_message = "Definition opened.".into();
+                                    } else if let Ok(path) = uri.to_file_path() {
+                                        self.pending_definition = Some(PendingDefinition {
+                                            path: path.clone(),
+                                            range,
+                                        });
+                                        self.pending_definition_open = Some(path);
+                                        self.status_message = "Opening definition…".into();
+                                    } else {
+                                        self.status_message = "Definition target cannot be opened by this workspace.".into();
+                                    }
+                                } else {
+                                    self.status_message = "Definition returned no location.".into();
+                                }
+                            }
+                            LspProviderKind::RenamePreparation | LspProviderKind::Rename => {
+                                self.status_message = format!("{label} response received.");
+                            }
+                        }
+                    }
+                    Ok(LspProviderResult::ReadOnly(crate::lsp::ProviderOutcome::Empty)) => {
+                        self.status_message = format!("{label} returned no result.");
+                    }
+                    Ok(LspProviderResult::RenamePrepared(Some(preparation))) => {
+                        self.overlay = Overlay::RenameInput {
+                            document_id,
+                            key,
+                            context,
+                            position,
+                            preparation,
+                            new_name: String::new(),
+                            invoker: self.focus,
+                        };
+                        self.status_message = "Rename: type a new name, Enter to confirm, Esc to cancel.".into();
+                    }
+                    Ok(LspProviderResult::RenamePrepared(None)) => {
+                        self.status_message = "Rename is unavailable at the cursor.".into();
+                    }
+                    Ok(LspProviderResult::RenameWorkspaceEdit(
+                        crate::lsp::RenameRequestOutcome::NotRenameable,
+                    )) => {
+                        self.status_message = "Rename returned no changes.".into();
+                    }
+                    Ok(LspProviderResult::RenameWorkspaceEdit(
+                        crate::lsp::RenameRequestOutcome::WorkspaceEditResponse {
+                            ticket: _,
+                            workspace_edit,
+                        },
+                    )) => {
+                        let authority = self.authorities.get(self.current_authority).cloned();
+                        let applied = match authority.map(|authority| authority.kind) {
+                            Some(AuthorityKind::Local) => self.local_authority.clone().map(|authority| {
+                                self.apply_rename_workspace_edit(
+                                    authority.as_ref(),
+                                    &key,
+                                    document_id,
+                                    context,
+                                    &workspace_edit,
+                                )
+                            }),
+                            Some(AuthorityKind::Ssh) => self.current_ssh_authority().map(|authority| {
+                                self.apply_rename_workspace_edit(
+                                    authority.as_ref(),
+                                    &key,
+                                    document_id,
+                                    context,
+                                    &workspace_edit,
+                                )
+                            }),
+                            Some(AuthorityKind::DevContainer) | None => None,
+                        };
+                        match applied {
+                            Some(Ok(crate::lsp::RenameApplyOutcome::Applied)) => {
+                                self.status_message = "Rename applied.".into();
+                            }
+                            Some(Ok(crate::lsp::RenameApplyOutcome::NoChanges)) => {
+                                self.status_message = "Rename returned no changes.".into();
+                            }
+                            Some(Ok(crate::lsp::RenameApplyOutcome::Rejected)) => {
+                                self.status_message = "Rename was rejected by the authority.".into();
+                            }
+                            Some(Err(error)) => {
+                                self.status_message = format!("Rename apply failed: {error}");
+                            }
+                            None => {
+                                self.status_message =
+                                    "Rename apply failed: authority is unavailable.".into();
+                            }
+                        }
+                    }
+                };
+            }
+            LspRuntimeEvent::Diagnostics {
+                key,
+                document_id,
+                context,
+                uri,
+                version,
+                diagnostics,
+            } => {
+                if !self.is_current_language_service_context(&key)
+                    || !self.lsp_supervisor.is_current_session(&key, &context)
+                {
+                    return;
+                }
+                let Some(buffer) = self.buffers.iter().find(|buffer| buffer.id() == document_id) else {
+                    return;
+                };
+                let Some(ledger) = buffer.lsp_ledger(&key.authority_identity, &key.execution_context) else {
+                    return;
+                };
+                let sent = hermito_protocol::lsp::LspContext {
+                    workspace_epoch: hermito_protocol::WorkspaceEpoch(ledger.workspace_epoch.0),
+                    environment_epoch: ledger.environment_epoch,
+                    document_revision: Some(hermito_protocol::DocumentRevision(ledger.revision.0)),
+                    sent_version: hermito_protocol::lsp::SentVersion(ledger.sent_version as u64),
+                    session_generation: hermito_protocol::lsp::SessionGeneration(ledger.session_generation),
+                    execution_context: ledger.context.clone(),
+                    authority_identity: ledger.authority_identity.clone(),
+                };
+                if version != Some(ledger.sent_version)
+                    || crate::lsp::LspClient::<AppLspTransport>::filter_stale_context(
+                        &context,
+                        &sent,
+                        Some(ledger),
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(normalized) =
+                    crate::lsp::LspClient::<AppLspTransport>::convert_diagnostics(&diagnostics)
+                else {
+                    return;
+                };
+                let entries = normalized
+                    .into_iter()
+                    .map(|diagnostic| ProblemDiagnostic {
+                        document_id,
+                        uri: uri.clone(),
+                        range: diagnostic.range,
+                        severity: diagnostic.severity.map(|severity| match severity {
+                            lsp_types::DiagnosticSeverity::ERROR => crate::lsp::NormalizedDiagnosticSeverity::Error,
+                            lsp_types::DiagnosticSeverity::WARNING => crate::lsp::NormalizedDiagnosticSeverity::Warning,
+                            lsp_types::DiagnosticSeverity::INFORMATION => crate::lsp::NormalizedDiagnosticSeverity::Information,
+                            lsp_types::DiagnosticSeverity::HINT => crate::lsp::NormalizedDiagnosticSeverity::Hint,
+                            _ => crate::lsp::NormalizedDiagnosticSeverity::Information,
+                        }),
+                        message: diagnostic.message,
+                        source: diagnostic.source,
+                    })
+                    .collect::<Vec<_>>();
+                self.diagnostics.insert((key.clone(), document_id), entries);
+                let count = self
+                    .diagnostics
+                    .iter()
+                    .filter(|((service, _), _)| service == &key)
+                    .map(|(_, diagnostics)| diagnostics.len())
+                    .sum();
+                self.record_language_diagnostic_count(key, count);
+            }
+        }
+    }
+
+    fn language_service_summary(&self) -> &'static str {
+        self.language_service_states
+            .values()
+            .map(|state| match state {
+                crate::lsp::LanguageServiceState::Failed { .. } => (0, state.status_label()),
+                crate::lsp::LanguageServiceState::VersionMismatch { .. } => {
+                    (1, state.status_label())
+                }
+                crate::lsp::LanguageServiceState::NotFound { .. } => (2, state.status_label()),
+                crate::lsp::LanguageServiceState::Blocked { .. } => (3, state.status_label()),
+                crate::lsp::LanguageServiceState::Starting => (4, state.status_label()),
+                crate::lsp::LanguageServiceState::Ready => (5, state.status_label()),
+            })
+            .min_by_key(|(priority, _)| *priority)
+            .map(|(_, label)| label)
+            .unwrap_or("idle")
+    }
+
+    fn normalized_diagnostic_count(&self) -> usize {
+        self.language_diagnostic_counts
+            .values()
+            .copied()
+            .fold(0usize, usize::saturating_add)
+    }
+
 
     pub fn snapshot(&self) -> AppSnapshot {
         let open_tabs: Vec<EditorTabSnapshot> = self
@@ -1243,6 +3392,12 @@ impl App {
                 path: path.clone(),
                 invoker: *invoker,
             },
+            Overlay::RenameInput {
+                new_name, invoker, ..
+            } => OverlaySnapshot::RenameInput {
+                new_name: new_name.clone(),
+                invoker: *invoker,
+            },
             Overlay::SshPassphrase {
                 authority_label,
                 passphrase,
@@ -1250,6 +3405,28 @@ impl App {
             } => OverlaySnapshot::SshPassphrase {
                 authority_label: authority_label.clone(),
                 length: passphrase.chars().count(),
+                invoker: *invoker,
+            },
+            Overlay::Completion {
+                position,
+                candidates,
+                selected,
+                invoker,
+                ..
+            } => OverlaySnapshot::Completion {
+                position: *position,
+                candidates: candidates
+                    .iter()
+                    .map(|candidate| CompletionCandidateSnapshot {
+                        label: candidate.label.clone(),
+                        detail: candidate.detail.clone(),
+                    })
+                    .collect(),
+                selected: *selected,
+                invoker: *invoker,
+            },
+            Overlay::Hover { document, invoker } => OverlaySnapshot::Hover {
+                document: document.clone(),
                 invoker: *invoker,
             },
         };
@@ -1298,8 +3475,8 @@ impl App {
             status: StatusSnapshot {
                 view: "editor".into(),
                 branch: None,
-                problems: 0,
-                service: "idle".into(),
+                problems: self.normalized_diagnostic_count(),
+                service: self.language_service_summary().into(),
                 message: if self.status_message.is_empty() {
                     None
                 } else {
@@ -1313,6 +3490,11 @@ impl App {
                 || !self.pending_compactions.is_empty(),
             workspace_root: self.workspace_root.clone(),
             workspace_name: self.workspace_name.clone(),
+            diagnostics: self
+                .diagnostics
+                .values()
+                .flat_map(|diagnostics| diagnostics.iter().cloned())
+                .collect(),
         }
     }
     /// Restore full persisted state + journal recovery (called by lib::run after load+validate).
@@ -1467,6 +3649,7 @@ impl App {
                 connection: AuthorityConnectionState::Connected,
             });
         }
+        let lsp_grants = state.lsp_grants;
         let workspace_root = state
             .trust
             .first()
@@ -1484,6 +3667,10 @@ impl App {
             "StatusBar" => Landmark::StatusBar,
             _ => Landmark::Editor,
         };
+        let (lsp_supervisor, lsp_event_rx) =
+            crate::lsp::LspSupervisor::channel(LSP_SUPERVISOR_EVENT_CHANNEL_CAPACITY);
+        let (lsp_runtime_tx, lsp_runtime_rx) =
+            tokio::sync::mpsc::channel(LSP_RUNTIME_EVENT_CHANNEL_CAPACITY);
         App {
             epoch,
             layout,
@@ -1509,13 +3696,25 @@ impl App {
             workspace_name: "workspace".into(),
             terminal: None,
             ssh_authorities: std::collections::HashMap::new(),
+            lsp_grants,
+            language_service_states: std::collections::HashMap::new(),
+            language_diagnostic_counts: std::collections::HashMap::new(),
+            language_servers: Vec::new(),
+            local_authority: None,
+            lsp_sessions: std::collections::HashMap::new(),
+            lsp_runtime_tx,
+            lsp_runtime_rx,
+            diagnostics: std::collections::HashMap::new(),
             terminal_starting: false,
             terminal_launch_id: 0,
             terminal_capture: false,
             submitted_ssh_passphrase: None,
+            pending_definition: None,
+            pending_definition_open: None,
+            lsp_supervisor,
+            lsp_event_rx,
         }
     }
-
     /// Produce versioned state for durable save at shutdown.
     pub fn to_state(&self) -> crate::persistence::state::AppState {
         use std::path::PathBuf;
@@ -1574,6 +3773,7 @@ impl App {
                 Landmark::StatusBar => "StatusBar".into(),
             },
             trust,
+            lsp_grants: self.lsp_grants.clone(),
         }
     }
     pub fn workspace_root(&self) -> &str {
@@ -1593,6 +3793,13 @@ impl App {
         } else {
             crate::authority::Authority::revoke_execution(authority.as_ref());
         }
+        // Generic terminal trust does not authorize LSP; restoration requires
+        // the authority's canonical identity and the exact configuration digest.
+        apply_persisted_lsp_grants(
+            &self.lsp_grants,
+            std::path::Path::new(&self.workspace_root),
+            authority.as_ref(),
+        );
         if let Some(state) = state {
             state.connection = if authority.is_connected() {
                 AuthorityConnectionState::Connected
@@ -1682,6 +3889,14 @@ impl App {
             authority.connection = connection;
         }
         self.status_message = message;
+        if connection == AuthorityConnectionState::Connected
+            && self
+                .authorities
+                .get(self.current_authority)
+                .is_some_and(|authority| authority.kind == AuthorityKind::Ssh && authority.label == label)
+        {
+            self.start_language_service_for_current_document();
+        }
     }
 
     pub fn set_current_authority_connection(&mut self, connection: AuthorityConnectionState) {
@@ -1736,6 +3951,7 @@ impl App {
                 launch_id: self.terminal_launch_id,
                 rows,
                 cols,
+                lsp_grants: self.lsp_grants.clone(),
             }),
             AuthorityKind::Ssh => {
                 let authority = self.ssh_authorities.get(&current.label)?.clone();

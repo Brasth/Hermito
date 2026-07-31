@@ -36,10 +36,14 @@ use hermito_protocol::{
     dispatcher::{
         negotiate, validate_for_dispatch, validate_frame_version, DispatchError, NegotiatedVersion,
     },
-    fs, process, pty as proto_pty,
+    fs,
+    lsp::{
+        AuthorityIdentity, LspContext, LspServerConfig, LspV1, SentVersion, SessionGeneration,
+    },
+    process, pty as proto_pty,
     request::RequestEnvelope,
     response::ResponseEnvelope,
-    ExtensionMessage, Message, MessageClass, ProtocolVersion, CURRENT_VERSION,
+    Message, MessageClass, ProtocolVersion, CURRENT_VERSION,
 };
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
@@ -172,10 +176,22 @@ fn frame_write_rejects_oversize_class_before_header() {
         extension: 4,
         ..FrameLimits::default()
     };
-    let big = Message::Lsp(ExtensionMessage {
-        family_version: 0,
-        kind: "x".into(),
-        body: vec![0u8; 16],
+    let big = Message::Lsp(LspV1::Start {
+        context: LspContext {
+            workspace_epoch: ws0(),
+            environment_epoch: env0(),
+            document_revision: None,
+            sent_version: SentVersion(0),
+            session_generation: SessionGeneration(0),
+            execution_context: ExecutionContextV1::AuthorityRoot,
+            authority_identity: AuthorityIdentity("local".into()),
+        },
+        config: LspServerConfig {
+            language_id: "x".into(),
+            program: "x".into(),
+            args: vec![],
+            cwd: "/".into(),
+        },
     });
     let err = block_on(write_message_version(
         &mut Vec::new(),

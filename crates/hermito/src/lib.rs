@@ -4,6 +4,7 @@ pub mod authority;
 pub mod buffer;
 pub mod config;
 pub mod coordinate;
+pub mod lsp;
 pub mod document;
 pub mod edit;
 pub mod event_loop;

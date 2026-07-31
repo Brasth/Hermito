@@ -2,6 +2,7 @@ pub mod dispatcher;
 pub mod frame;
 pub mod fs;
 pub mod process;
+pub mod lsp;
 pub mod pty;
 pub mod request;
 pub mod response;
@@ -72,7 +73,7 @@ pub enum Message {
     Pty(pty::PtyMessage),
     Fs(fs::FsMessage),
     Process(process::ProcessMessage),
-    Lsp(ExtensionMessage),
+    Lsp(lsp::LspV1),
     Git(ExtensionMessage),
     Container(ExtensionMessage),
     Relay(ExtensionMessage),

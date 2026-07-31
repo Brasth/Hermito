@@ -1,5 +1,8 @@
 use crate::document::{BufferPathState, DocumentId, DocumentRevision, Language, WorkspaceEpoch};
 use crate::edit::TextEdit;
+use crate::lsp::{AuthorityIdentity, LspDocumentLedger, LspLedgerMap};
+use hermito_protocol::request::{EnvironmentEpoch, ExecutionContextV1};
+use std::collections::HashMap;
 use ropey::Rope;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -43,6 +46,7 @@ pub struct Buffer {
     path_state: BufferPathState,
     dirty: bool,
     last_checkpointed_revision: Option<DocumentRevision>,
+    lsp_ledgers: LspLedgerMap,
 }
 
 impl Buffer {
@@ -60,6 +64,7 @@ impl Buffer {
             },
             dirty: false,
             last_checkpointed_revision: None,
+            lsp_ledgers: HashMap::new(),
         }
     }
 
@@ -78,6 +83,7 @@ impl Buffer {
             path_state,
             dirty: false,
             last_checkpointed_revision: Some(revision),
+            lsp_ledgers: HashMap::new(),
         }
     }
 
@@ -91,6 +97,7 @@ impl Buffer {
         b.last_checkpointed_revision = Some(payload.revision);
         b.dirty = true;
         b.path_state = path_state;
+        b.lsp_ledgers = HashMap::new();
         b
     }
 
@@ -231,10 +238,24 @@ impl Buffer {
         self.revision = self.revision.increment();
         self.dirty = true;
 
+        // Atomically advance per-authority LSP ledgers at the exact mutation boundary.
+        // This ensures every tracked context sees revision, sent_version, epoch and
+        // full-text snapshot updated together for future didChange scheduling.
+        // Only existing ledgers are touched (no implicit registration on edit).
+        let content = self.rope.to_string();
+        for authority_ledgers in self.lsp_ledgers.values_mut() {
+            for entry in authority_ledgers.values_mut() {
+                entry.revision = self.revision;
+                entry.sent_version = entry.sent_version.saturating_add(1);
+                entry.workspace_epoch = epoch;
+                entry.text = content.clone();
+            }
+        }
+
         let payload = CheckpointPayload {
             doc_id: self.id,
             revision: self.revision,
-            content: self.rope.to_string(),
+            content,
             language: self.language,
             path: self.path().map(|p| p.to_path_buf()),
             epoch,
@@ -248,10 +269,135 @@ impl Buffer {
     pub fn snapshot_rope(&self) -> Rope {
         self.rope.clone()
     }
+    pub fn lsp_ledger(
+        &self,
+        authority_identity: &AuthorityIdentity,
+        context: &ExecutionContextV1,
+    ) -> Option<&LspDocumentLedger> {
+        self.lsp_ledgers
+            .get(authority_identity)
+            .and_then(|authority_ledgers| authority_ledgers.get(context))
+    }
+
+    /// Replace the complete contents after an Authority has committed the same
+    /// workspace edit. The exact authority/context ledger must still describe
+    /// the supplied revision and epochs before this buffer can advance.
+    pub fn apply_lsp_workspace_replacement(
+        &mut self,
+        authority_identity: &AuthorityIdentity,
+        context: &ExecutionContextV1,
+        expected: DocumentRevision,
+        workspace_epoch: WorkspaceEpoch,
+        environment_epoch: EnvironmentEpoch,
+        replacement: &str,
+    ) -> Result<DocumentRevision, StaleRevision> {
+        let ledger = self
+            .lsp_ledger(authority_identity, context)
+            .ok_or(StaleRevision)?;
+        if self.revision != expected
+            || ledger.revision != expected
+            || ledger.workspace_epoch != workspace_epoch
+            || ledger.environment_epoch != environment_epoch
+        {
+            return Err(StaleRevision);
+        }
+        self.apply_edit(
+            expected,
+            TextEdit {
+                start_byte: 0,
+                old_end_byte: self.rope.len_bytes(),
+                replacement: replacement.to_owned(),
+            },
+            workspace_epoch,
+        )
+        .map(|(revision, _)| revision)
+    }
+
+    /// Ensure a ledger entry exists for one exact authority identity and execution context.
+    /// If absent, initialize using current buffer state with sent_version=0 and
+    /// session_generation=0. Epochs are captured at registration time; mutations
+    /// update workspace_epoch.
+    pub fn ensure_lsp_ledger(
+        &mut self,
+        authority_identity: AuthorityIdentity,
+        context: ExecutionContextV1,
+        workspace_epoch: WorkspaceEpoch,
+        environment_epoch: EnvironmentEpoch,
+    ) -> LspDocumentLedger {
+        self.lsp_ledgers
+            .entry(authority_identity.clone())
+            .or_default()
+            .entry(context.clone())
+            .or_insert_with(|| LspDocumentLedger {
+                authority_identity,
+                context,
+                revision: self.revision,
+                sent_version: 0,
+                session_generation: 0,
+                workspace_epoch,
+                environment_epoch,
+                text: self.rope.to_string(),
+            })
+            .clone()
+    }
+
+    /// Reset for a new LSP session under one authority/context pair:
+    /// sent_version=0 and bumped session_generation.
+    pub fn reset_lsp_session(
+        &mut self,
+        authority_identity: AuthorityIdentity,
+        context: ExecutionContextV1,
+        workspace_epoch: WorkspaceEpoch,
+        environment_epoch: EnvironmentEpoch,
+    ) -> LspDocumentLedger {
+        let authority_ledgers = self.lsp_ledgers.entry(authority_identity.clone()).or_default();
+        let session_generation = authority_ledgers
+            .get(&context)
+            .map(|ledger| {
+                ledger
+                    .session_generation
+                    .checked_add(1)
+                    .expect("LSP session generation exhausted")
+            })
+            .unwrap_or(1);
+        let ledger = LspDocumentLedger {
+            authority_identity,
+            context: context.clone(),
+            revision: self.revision,
+            sent_version: 0,
+            session_generation,
+            workspace_epoch,
+            environment_epoch,
+            text: self.rope.to_string(),
+        };
+        authority_ledgers.insert(context, ledger.clone());
+        ledger
+    }
+
+    /// Explicit bump of session generation (without resetting sent_version).
+    /// No-op when that authority/context ledger is absent.
+    pub fn bump_lsp_session_generation(
+        &mut self,
+        authority_identity: &AuthorityIdentity,
+        context: &ExecutionContextV1,
+    ) {
+        if let Some(ledger) = self
+            .lsp_ledgers
+            .get_mut(authority_identity)
+            .and_then(|authority_ledgers| authority_ledgers.get_mut(context))
+        {
+            ledger.session_generation = ledger.session_generation.wrapping_add(1);
+        }
+    }
+
+    /// Borrow the authority-partitioned ledger map for scheduling without copies.
+    pub fn lsp_ledgers(&self) -> &LspLedgerMap {
+        &self.lsp_ledgers
+    }
 }
 
 /// Ropey-supported char boundary check: walk chunks (each a &str at char bndry) and delegate to str.
-fn is_char_boundary(rope: &Rope, byte_idx: usize) -> bool {
+pub(crate) fn is_char_boundary(rope: &Rope, byte_idx: usize) -> bool {
     let len = rope.len_bytes();
     if byte_idx == 0 || byte_idx == len {
         return true;
@@ -272,7 +418,7 @@ fn is_char_boundary(rope: &Rope, byte_idx: usize) -> bool {
 }
 
 /// Find the greatest char boundary <= byte (inclusive of 0), using Ropey-supported is_char_boundary.
-fn prev_char_boundary(rope: &Rope, mut byte: usize) -> usize {
+pub(crate) fn prev_char_boundary(rope: &Rope, mut byte: usize) -> usize {
     let len = rope.len_bytes();
     byte = byte.min(len);
     while byte > 0 && !is_char_boundary(rope, byte) {
